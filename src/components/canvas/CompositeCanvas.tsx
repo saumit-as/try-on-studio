@@ -79,6 +79,8 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
   const [showNailHandles, setShowNailHandles] = useState<boolean>(true);
   const [hoveredFinger, setHoveredFinger] = useState<FingerName | null>(null);
   const dragHandleRef = useRef<DragHandleTarget | null>(null);
+  const clickStartPosRef = useRef<{ x: number; y: number } | null>(null);
+  const wasDraggingRef = useRef<boolean>(false);
 
   // Rendering state
   const [compositeImageSrc, setCompositeImageSrc] = useState<string | null>(null);
@@ -203,7 +205,23 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
     [pan, zoom]
   );
 
+  // Handle Escape key to deselect active finger
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (selectedFinger !== "All") {
+          updateLightingState({ selectedFinger: "All" });
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedFinger, updateLightingState]);
+
   const handleMouseDown = (e: ReactMouseEvent<HTMLDivElement>) => {
+    clickStartPosRef.current = { x: e.clientX, y: e.clientY };
+    wasDraggingRef.current = false;
+
     if (e.button === 1 || isSpacePressed) {
       e.preventDefault();
       setIsPanning(true);
@@ -217,6 +235,16 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
   };
 
   const handleMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (clickStartPosRef.current) {
+      const dist = Math.hypot(
+        e.clientX - clickStartPosRef.current.x,
+        e.clientY - clickStartPosRef.current.y
+      );
+      if (dist > 5) {
+        wasDraggingRef.current = true;
+      }
+    }
+
     if (isPanning && panStartRef.current) {
       const dx = e.clientX - panStartRef.current.startX;
       const dy = e.clientY - panStartRef.current.startY;
@@ -282,6 +310,14 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
     setIsPanning(false);
     panStartRef.current = null;
     dragHandleRef.current = null;
+  };
+
+  // Click outside to deselect
+  const handleCanvasClick = () => {
+    if (wasDraggingRef.current) return;
+    if (selectedFinger !== "All") {
+      updateLightingState({ selectedFinger: "All" });
+    }
   };
 
   // Compile mapped nails dictionary
@@ -522,6 +558,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
+      onClick={handleCanvasClick}
       className={`w-full h-full relative overflow-hidden bg-neutral-950 select-none ${
         isPanning || isSpacePressed
           ? "cursor-grab active:cursor-grabbing"
@@ -551,6 +588,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
           <svg
             className="absolute inset-0 w-full h-full pointer-events-auto"
             viewBox={`0 0 ${templateWidth} ${templateHeight}`}
+            onClick={handleCanvasClick}
           >
             {fingerGeometries.map((geom) => {
               if (!geom) return null;
@@ -620,6 +658,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
                       {/* 1. Tip Length Handle (pull along axis to scale length) */}
                       <g
                         className="cursor-ns-resize"
+                        onClick={(e) => e.stopPropagation()}
                         onMouseDown={(e) => {
                           e.stopPropagation();
                           const { x, y } = getStageCoords(e.clientX, e.clientY);
@@ -659,6 +698,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
                       {/* 2. Left Width Handle */}
                       <g
                         className="cursor-ew-resize"
+                        onClick={(e) => e.stopPropagation()}
                         onMouseDown={(e) => {
                           e.stopPropagation();
                           const { x, y } = getStageCoords(e.clientX, e.clientY);
@@ -691,6 +731,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
                       {/* 3. Right Width Handle */}
                       <g
                         className="cursor-ew-resize"
+                        onClick={(e) => e.stopPropagation()}
                         onMouseDown={(e) => {
                           e.stopPropagation();
                           const { x, y } = getStageCoords(e.clientX, e.clientY);
@@ -723,6 +764,7 @@ export const CompositeCanvas: React.FC<CompositeCanvasProps> = ({
                       {/* 4. Cuticle Base Tuck Handle */}
                       <g
                         className="cursor-ns-resize"
+                        onClick={(e) => e.stopPropagation()}
                         onMouseDown={(e) => {
                           e.stopPropagation();
                           const { x, y } = getStageCoords(e.clientX, e.clientY);

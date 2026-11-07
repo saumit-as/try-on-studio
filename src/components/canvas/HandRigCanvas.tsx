@@ -127,7 +127,9 @@ export const HandRigCanvas: React.FC<HandRigCanvasProps> = ({
   // Handle Spacebar hotkey for panning
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === "Space" && !e.repeat) {
+      if (e.key === "Escape") {
+        setHandState((p) => ({ ...p, activeFinger: "All" }));
+      } else if (e.code === "Space" && !e.repeat) {
         const target = e.target as HTMLElement;
         if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA") {
           setIsSpacePressed(true);
@@ -359,6 +361,11 @@ export const HandRigCanvas: React.FC<HandRigCanvasProps> = ({
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
+      onClick={() => {
+        if (activeFinger !== "All" && !isPanning && !draggingLandmark && !boxStart) {
+          setHandState((p) => ({ ...p, activeFinger: "All" }));
+        }
+      }}
       className={`w-full h-full relative overflow-hidden bg-neutral-950 select-none ${
         isPanning || isSpacePressed
           ? "cursor-grab active:cursor-grabbing"
