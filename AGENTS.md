@@ -66,9 +66,9 @@ try-on-studio/
 | **Realism Scoring & Quality Benchmark** | ✅ Complete | `score_realism_agent.py` & `test_all_nails.py` (83.2+ score) |
 | **Phase 4 Backend: 6-Pass PBR Compositor** | ✅ Complete | Glare healing, studio diffuse relighting, gel topcoat ribbon, contact drop shadows |
 | **Phase 2: Tray Extractor UI & Pen Tool** | ✅ Complete | Photoshop Bezier pen tool, pan/zoom, inspection modal, exact-mask design preservation |
-| **Phase 3: Hand Rigging Canvas** | 🟡 **Next Up** | 5-point landmark placement on custom hands |
-| **Phase 4 Frontend: Compositor UI** | ⏳ Planned | Dual-tier lighting sliders and live preview |
-| **Phase 5: Production Export** | ⏳ Planned | 300 DPI PNG & layered PSD export |
+| **Phase 3: Hand Rigging Canvas & Bundled Master Template** | ✅ Complete | 5-point landmark rigging, pan/zoom canvas, procedural cuticle/AO/specular maps, `.nailtemplate` bundle |
+| **Phase 4: Real-Time PBR Compositor & Live Viewport** | ✅ Complete | Real-time viewport, dual-tier lighting controls, 98/100 visual audit score |
+| **Phase 5: Production Export & Layered PSD** | 🟡 **Next Up** | 300 DPI PNG & multi-layer PSD export |
 
 ---
 
@@ -94,3 +94,14 @@ When picking up a task or continuing development:
 - **Windows**: Use `#[cfg(target_os = "windows")]` for Win32-specific APIs (e.g. `CREATE_NO_WINDOW`, Job Objects).
 - **macOS**: Target triples are `aarch64-apple-darwin` (Apple Silicon) and `x86_64-apple-darwin` (Intel). Binaries are resolved via `Contents/MacOS/` or `Contents/Resources/`.
 - Paths must be normalized with `PathBuf` / `pathlib.Path` across JSON-RPC boundaries.
+
+### 5. Knowledge Graph & Architecture Queries (Graphify Skill)
+- **Consult Graphify First**: Whenever investigating codebase architecture, cross-module relationships, call flows, symbol definitions, or data flows, always check the local knowledge graph in `graphify-out/` before brute-force file grepping:
+  - **CLI Queries**: Use `graphify query "<question>"`, `graphify path "<source>" "<target>"`, or `graphify explain "<concept>"`.
+  - **MCP Navigation**: If the `graphify` MCP server is active, use `query_graph`, `shortest_path`, or `get_node`.
+  - **Visual & Structural Reference**: Consult [`graphify-out/GRAPH_REPORT.md`](graphify-out/GRAPH_REPORT.md) or open [`graphify-out/graph.html`](graphify-out/graph.html).
+- **Keep Graph in Sync**: After modifying or adding files during a session, run:
+  ```powershell
+  graphify update .
+  ```
+  to keep `graphify-out/graph.json` synchronized without incurring LLM token costs.

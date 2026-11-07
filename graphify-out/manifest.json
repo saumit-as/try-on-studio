@@ -1,0 +1,233 @@
+{
+  ".vscode/extensions.json": {
+    "mtime": 1794000157.5988529,
+    "seen": 1794087237.4577649,
+    "ast_hash": "d1846e92ceedfa6eb08a69cbb38c190a",
+    "semantic_hash": "d1846e92ceedfa6eb08a69cbb38c190a",
+    "ast_empty": true
+  },
+  "package.json": {
+    "mtime": 1794000157.5998535,
+    "seen": 1794087237.4577727,
+    "ast_hash": "1b96873b5f8075056156e1f745525e7e",
+    "semantic_hash": "1b96873b5f8075056156e1f745525e7e"
+  },
+  "public/templates/default_studio_hand/template.json": {
+    "mtime": 1794086993.5516129,
+    "seen": 1794087237.4580142,
+    "ast_hash": "74a80c31297c642cdae81793c9c1a859",
+    "semantic_hash": "74a80c31297c642cdae81793c9c1a859",
+    "ast_empty": true
+  },
+  "python_sidecar/build_sidecar.py": {
+    "mtime": 1794000157.603853,
+    "seen": 1794087237.4580173,
+    "ast_hash": "e680b5a50d16316625baa23b09ff48dc",
+    "semantic_hash": "e680b5a50d16316625baa23b09ff48dc"
+  },
+  "python_sidecar/compositor.py": {
+    "mtime": 1794051987.612523,
+    "seen": 1794087237.458213,
+    "ast_hash": "734064bc241b172f8ffbb5f57917025a",
+    "semantic_hash": "734064bc241b172f8ffbb5f57917025a"
+  },
+  "python_sidecar/main.py": {
+    "mtime": 1794087053.98638,
+    "seen": 1794087237.4583948,
+    "ast_hash": "d74a37219613812ec8199aa23a6af164",
+    "semantic_hash": "d74a37219613812ec8199aa23a6af164"
+  },
+  "python_sidecar/render_target_hand.py": {
+    "mtime": 1794053161.1826189,
+    "seen": 1794087237.4585886,
+    "ast_hash": "cfb9c78b1260c8514a1f51f095d2f542",
+    "semantic_hash": "cfb9c78b1260c8514a1f51f095d2f542"
+  },
+  "python_sidecar/score_realism_agent.py": {
+    "mtime": 1794052263.699284,
+    "seen": 1794087237.458847,
+    "ast_hash": "4235976e496c2cedba2222357dbd1f87",
+    "semantic_hash": "4235976e496c2cedba2222357dbd1f87"
+  },
+  "python_sidecar/segmentation.py": {
+    "mtime": 1794085538.2581992,
+    "seen": 1794087237.4591143,
+    "ast_hash": "6e417c35923ddf464eb4f16c590b894e",
+    "semantic_hash": "6e417c35923ddf464eb4f16c590b894e"
+  },
+  "python_sidecar/template_generator.py": {
+    "mtime": 1794086985.3098197,
+    "seen": 1794087237.4594085,
+    "ast_hash": "e8ab0800a34f66441f0a0e668e35fed0",
+    "semantic_hash": "e8ab0800a34f66441f0a0e668e35fed0"
+  },
+  "python_sidecar/test_all_nails.py": {
+    "mtime": 1794044507.2264605,
+    "seen": 1794087237.4596088,
+    "ast_hash": "5e9e77fb60fb5f69f2a5bf6d1cdf1c40",
+    "semantic_hash": "5e9e77fb60fb5f69f2a5bf6d1cdf1c40"
+  },
+  "python_sidecar/test_pipeline.py": {
+    "mtime": 1794043146.275096,
+    "seen": 1794087237.4598553,
+    "ast_hash": "916a4b65efa5151c28999144df245397",
+    "semantic_hash": "916a4b65efa5151c28999144df245397"
+  },
+  "python_sidecar/test_template_rig.py": {
+    "mtime": 1794087065.7770271,
+    "seen": 1794087237.4600477,
+    "ast_hash": "58f1d47f3f76324f8b21bed6b181d925",
+    "semantic_hash": "58f1d47f3f76324f8b21bed6b181d925"
+  },
+  "python_sidecar/warping.py": {
+    "mtime": 1794050486.3194273,
+    "seen": 1794087237.4602315,
+    "ast_hash": "6e5c9c4527b65d7b3171c6d3b1c895b8",
+    "semantic_hash": "6e5c9c4527b65d7b3171c6d3b1c895b8"
+  },
+  "src-tauri/Cargo.toml": {
+    "mtime": 1794000157.6098518,
+    "seen": 1794087237.4604201,
+    "ast_hash": "d04fba71d832190704199ec9eb44cc9d",
+    "semantic_hash": "d04fba71d832190704199ec9eb44cc9d"
+  },
+  "src-tauri/build.rs": {
+    "mtime": 1794000157.6108515,
+    "seen": 1794087237.4606135,
+    "ast_hash": "667702979da61fdc96948886b7cd7a33",
+    "semantic_hash": "667702979da61fdc96948886b7cd7a33"
+  },
+  "src-tauri/capabilities/default.json": {
+    "mtime": 1794000157.6128528,
+    "seen": 1794087237.4607913,
+    "ast_hash": "903e3c84568adc62ad97ef9b8a4a1010",
+    "semantic_hash": "903e3c84568adc62ad97ef9b8a4a1010"
+  },
+  "src-tauri/src/lib.rs": {
+    "mtime": 1794000859.410203,
+    "seen": 1794087237.4609747,
+    "ast_hash": "fad174ba149ec1e497466e6133b8607d",
+    "semantic_hash": "fad174ba149ec1e497466e6133b8607d"
+  },
+  "src-tauri/src/main.rs": {
+    "mtime": 1794000157.6248517,
+    "seen": 1794087237.461159,
+    "ast_hash": "915d9d129b6bf32482f73be688bdf71b",
+    "semantic_hash": "915d9d129b6bf32482f73be688bdf71b"
+  },
+  "src-tauri/src/sidecar.rs": {
+    "mtime": 1794028561.6101131,
+    "seen": 1794087237.461419,
+    "ast_hash": "d6a3e8cff4496f3218d421ec7a686d92",
+    "semantic_hash": "d6a3e8cff4496f3218d421ec7a686d92"
+  },
+  "src-tauri/tauri.conf.json": {
+    "mtime": 1794000157.625851,
+    "seen": 1794087237.4616466,
+    "ast_hash": "3ca44157235760be1a441f770e581093",
+    "semantic_hash": "3ca44157235760be1a441f770e581093"
+  },
+  "src/App.tsx": {
+    "mtime": 1794076100.2364876,
+    "seen": 1794087237.4618313,
+    "ast_hash": "9507b5ad2fe6ca4e01ee1a0cfe68ff67",
+    "semantic_hash": "9507b5ad2fe6ca4e01ee1a0cfe68ff67"
+  },
+  "src/components/canvas/CanvasViewport.tsx": {
+    "mtime": 1794085600.4102676,
+    "seen": 1794087237.4620233,
+    "ast_hash": "ca171cabf33701a54b337dae1efd8cf1",
+    "semantic_hash": "ca171cabf33701a54b337dae1efd8cf1"
+  },
+  "src/components/inspector/ExportControls.tsx": {
+    "mtime": 1794029963.7412674,
+    "seen": 1794087237.4622154,
+    "ast_hash": "30e72f1b2bc598faeef9c4ccaffac108",
+    "semantic_hash": "30e72f1b2bc598faeef9c4ccaffac108"
+  },
+  "src/components/inspector/HandControls.tsx": {
+    "mtime": 1794087179.4989831,
+    "seen": 1794087237.4624,
+    "ast_hash": "8a8d080e6226e21cbb4d99dc5b9ecf33",
+    "semantic_hash": "8a8d080e6226e21cbb4d99dc5b9ecf33"
+  },
+  "src/components/inspector/InspectorPanel.tsx": {
+    "mtime": 1794087225.699776,
+    "seen": 1794087237.4625814,
+    "ast_hash": "ef7f897b0956b9530a97643bc55f3cbc",
+    "semantic_hash": "ef7f897b0956b9530a97643bc55f3cbc"
+  },
+  "src/components/inspector/LightingControls.tsx": {
+    "mtime": 1794029948.4948535,
+    "seen": 1794087237.4627638,
+    "ast_hash": "636e510af78a5b51aabccd1048ce8710",
+    "semantic_hash": "636e510af78a5b51aabccd1048ce8710"
+  },
+  "src/components/inspector/TrayControls.tsx": {
+    "mtime": 1794086129.016102,
+    "seen": 1794087237.4629445,
+    "ast_hash": "ef1978548731418347ed9e173824455c",
+    "semantic_hash": "ef1978548731418347ed9e173824455c"
+  },
+  "src/components/layout/Header.tsx": {
+    "mtime": 1794029913.3962424,
+    "seen": 1794087237.463121,
+    "ast_hash": "098288fb6b7400811862136f02e35a68",
+    "semantic_hash": "098288fb6b7400811862136f02e35a68"
+  },
+  "src/constants/handDefaults.ts": {
+    "mtime": 1794087122.9132018,
+    "seen": 1794087237.4633,
+    "ast_hash": "3ca84483c0f30d034386f6b106e54fb5",
+    "semantic_hash": "3ca84483c0f30d034386f6b106e54fb5"
+  },
+  "src/main.tsx": {
+    "mtime": 1794000157.6288517,
+    "seen": 1794087237.4634914,
+    "ast_hash": "ea7bebc824e5f67b3b9aef34cb4f9491",
+    "semantic_hash": "ea7bebc824e5f67b3b9aef34cb4f9491"
+  },
+  "src/services/sidecar.ts": {
+    "mtime": 1794000157.629852,
+    "seen": 1794087237.4636633,
+    "ast_hash": "404c26ca1a2365adbbd8e27817a98346",
+    "semantic_hash": "404c26ca1a2365adbbd8e27817a98346"
+  },
+  "src/types/index.ts": {
+    "mtime": 1794087088.5689883,
+    "seen": 1794087237.4638379,
+    "ast_hash": "aae317afff3da6cc7462111ef3411c5d",
+    "semantic_hash": "aae317afff3da6cc7462111ef3411c5d"
+  },
+  "src/vite-env.d.ts": {
+    "mtime": 1794000157.630851,
+    "seen": 1794087237.4640157,
+    "ast_hash": "8f68c27c3fc38817b2726b20e2d4f1ee",
+    "semantic_hash": "8f68c27c3fc38817b2726b20e2d4f1ee"
+  },
+  "templates/default_studio_hand/template.json": {
+    "mtime": 1794086993.4850278,
+    "seen": 1794087237.464222,
+    "ast_hash": "74a80c31297c642cdae81793c9c1a859",
+    "semantic_hash": "74a80c31297c642cdae81793c9c1a859",
+    "ast_empty": true
+  },
+  "tsconfig.json": {
+    "mtime": 1794000157.630851,
+    "seen": 1794087237.464229,
+    "ast_hash": "3665a98bc1420342958656f7b11e7a67",
+    "semantic_hash": "3665a98bc1420342958656f7b11e7a67"
+  },
+  "tsconfig.node.json": {
+    "mtime": 1794000157.6318512,
+    "seen": 1794087237.464442,
+    "ast_hash": "281e378713152cccc7860c818db55849",
+    "semantic_hash": "281e378713152cccc7860c818db55849"
+  },
+  "vite.config.ts": {
+    "mtime": 1794000157.6318512,
+    "seen": 1794087237.464683,
+    "ast_hash": "a38069d8d43e8a14d434f980bb245c82",
+    "semantic_hash": "a38069d8d43e8a14d434f980bb245c82"
+  }
+}

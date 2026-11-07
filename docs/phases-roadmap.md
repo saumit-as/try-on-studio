@@ -112,16 +112,16 @@ Launch `pnpm tauri dev`, open the **Tray Extractor** tab, upload a photo of a pr
 
 ---
 
-## Phase 3: Hand Template Rigging & Bundled Master Hand
+## Phase 3: Hand Template Rigging & Bundled Master Hand — [COMPLETED ✅]
 
 > **Objective:** Enable users to set up hand templates by placing finger anchor landmarks and automatically generating procedural occlusion and shadow maps, plus ship a pre-rigged master hand template.
 
 ### Tasks
-- [ ] Ship with a built-in **Default Studio Hand Template** (`templates/default_studio_hand/`):
+- [x] Ship with a built-in **Default Studio Hand Template** (`templates/default_studio_hand/` & `public/templates/default_studio_hand/`):
   - High-res unpolished bare hand image with all 5 fingers facing forward on a single focal plane.
-  - Pre-measured 5-point landmark coordinates per finger.
+  - Pre-measured 5-point landmark coordinates per finger (`c_l`, `c_c`, `c_r`, `d_l`, `d_r`).
   - Pre-baked cuticle alpha mask, contact AO shadow map, and specular gloss map.
-- [ ] Implement Bare Hand canvas in [`CanvasViewport.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/CanvasViewport.tsx):
+- [x] Implement Bare Hand canvas in [`HandRigCanvas.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/HandRigCanvas.tsx) & [`CanvasViewport.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/CanvasViewport.tsx):
   - Zoom and pan controls for sub-pixel landmark placement.
   - Interactive 5-point landmark placement per finger:
     1. Cuticle Apex (top center of proximal fold)
@@ -129,11 +129,14 @@ Launch `pnpm tauri dev`, open the **Tray Extractor** tab, upload a photo of a pr
     3. Right Lateral Sidewall
     4. Distal Edge Left
     5. Distal Edge Right
-- [ ] Implement procedural map generation in `python_sidecar/template_generator.py`:
+  - Live wireframe geometry visualization (curved cuticle U-arch, sidewalls, distal free edge, longitudinal centerline axis).
+  - Multi-layer procedural overlays (Cuticle tuck pass, Contact AO shadow pass, Specular gloss ribbon).
+  - Floating bottom toolbar with zoom, fit-to-screen, overlay toggles, and finger switcher.
+- [x] Implement procedural map generation in `python_sidecar/template_generator.py`:
   - Eponychium skin fold occlusion mask ($0.5\text{px} - 0.7\text{px}$ Gaussian feathered edge).
   - Contact ambient occlusion (AO) shadow map along the cuticle seam.
   - Specular gloss reflection vector map.
-- [ ] Implement `.nailtemplate` serialization (JSON metadata + generated PNG masks) in OS AppData directory.
+- [x] Implement `.nailtemplate` serialization (JSON metadata + generated PNG masks) and export/import bundle support.
 
 ### 🧪 Testable Deliverable
 Open the **Hand Rigging** tab:

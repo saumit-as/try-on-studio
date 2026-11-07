@@ -20,6 +20,10 @@ dist
 dist-ssr
 *.local
 
+# Local knowledge graph cache
+graphify-out/cache/
+test_assets/target_hand_detected_vis.jpg
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
