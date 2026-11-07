@@ -61,20 +61,22 @@ This roadmap breaks down the full Try-On Studio architecture into **5 sequential
 
 ---
 
-## Phase 2: Tray Extractor UI & Interactive Slot Mapping
+## Phase 2: Tray Extractor UI & Interactive Slot Mapping — [COMPLETED ✅]
 
 > **Objective:** Connect the React frontend to the sidecar's segmentation engine so users can upload photos, inspect detected nails, and assign them to fingers.
 
 ### Tasks
-- [ ] Implement image file picker & drag-and-drop upload in [`CanvasViewport.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/CanvasViewport.tsx).
-- [ ] Connect [`TrayControls.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/inspector/TrayControls.tsx) to sidecar `segment_tray`:
-  - Display classified shape badge (e.g., `[Detected Shape: Coffin]`) with manual override dropdown.
-  - Render interactive SVG/Canvas overlay over the tray photo with numbered slots (1–5 / 10).
-  - Draggable contour vertices and bounding boxes for manual micro-nudging.
-- [ ] Wire orientation controls:
-  - 180° flip (swaps cuticle and tip).
-  - Fine-rotation slider (-45° to +45°).
-- [ ] Wire Slot-to-Finger chip assignment (Thumb, Index, Middle, Ring, Pinky).
+- [x] Implement image file picker & drag-and-drop upload in [`CanvasViewport.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/CanvasViewport.tsx).
+- [x] Connect [`TrayControls.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/inspector/TrayControls.tsx) to sidecar `segment_tray`:
+  - [x] Display classified shape badge (e.g., `[Detected Shape: Coffin]`) with manual override dropdown.
+  - [x] Render interactive SVG/Canvas overlay over the tray photo with numbered slots (1–5 / 15).
+  - [x] Draggable contour vertices, 8-point resize handles, and bounding boxes for manual micro-nudging.
+  - [x] Position nudge D-pad (1px & 5px steps) and width/length dimension adjusters.
+  - [x] Localized computer-vision snapping (`refit_slot_contour`) and "Reset to Auto" revert.
+- [x] Wire orientation controls:
+  - [x] 180° flip (swaps cuticle and tip).
+  - [x] Fine-rotation slider (-45° to +45°).
+- [x] Wire Slot-to-Finger chip assignment (Thumb, Index, Middle, Ring, Pinky).
 
 ### 🧪 Testable Deliverable
 Launch `pnpm tauri dev`, open the **Tray Extractor** tab, upload a photo of a press-on nail packaging tray:
