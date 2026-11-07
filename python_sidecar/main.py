@@ -22,7 +22,12 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 from segmentation import segment_packaging_tray, extract_nail_rgba, deskew_nail_pca, classify_nail_shape
-from warping import apply_cylindrical_c_curve, build_3tier_control_grid, warp_nail_tps
+from warping import (
+    apply_cylindrical_c_curve,
+    build_3tier_control_grid,
+    warp_nail_tps,
+    build_cuticle_pocket_mask,
+)
 
 
 def handle_ping(params):
@@ -68,14 +73,16 @@ def handle_segment_tray(params):
 def handle_extract_nail(params):
     img = _load_image(params)
     contour = np.array(params["contour"], dtype=np.int32)
-    feather_px = float(params.get("feather_px", 0.7))
-    rgba = extract_nail_rgba(img, contour, feather_px=feather_px)
-
-    deskew = params.get("deskew", True)
-    if deskew:
-        angle, rotated_cnt, deskewed_rgba = deskew_nail_pca(contour, rgba)
-        if deskewed_rgba is not None:
-            rgba = deskewed_rgba
+    feather_px = float(params.get("feather_px", 1.2))
+    deskew = bool(params.get("deskew", True))
+    auto_orient = bool(params.get("auto_orient_cuticle_down", True))
+    rgba = extract_nail_rgba(
+        img,
+        contour,
+        feather_px=feather_px,
+        deskew=deskew,
+        auto_orient_cuticle_down=auto_orient,
+    )
 
     # Encode as PNG base64
     success, buffer = cv2.imencode(".png", rgba)
@@ -134,10 +141,31 @@ def handle_warp_nail(params):
         distal_left=params["distal_left"],
         distal_right=params["distal_right"],
         length_scale=length_scale,
+        tip_taper=float(params.get("tip_taper", 1.02)),
+        roll_offset=roll_offset,
     )
 
     # 3. Thin-Plate Spline deformation
     warped_roi, bbox = warp_nail_tps(curved_nail, src_pts, dst_pts, output_shape)
+
+    # 4. Apply anatomical cuticle & sidewall skin-fold tuck mask
+    rx, ry, rw, rh = bbox
+    if rw > 0 and rh > 0:
+        pocket_allow, cuticle_ao = build_cuticle_pocket_mask(
+            roi_bbox=bbox,
+            cuticle_left=params["cuticle_left"],
+            cuticle_center=params["cuticle_center"],
+            cuticle_right=params["cuticle_right"],
+            distal_left=params["distal_left"],
+            distal_right=params["distal_right"],
+            feather_sigma=1.6,
+        )
+        warped_roi[:, :, :3] = np.clip(
+            warped_roi[:, :, :3].astype(np.float32) * cuticle_ao[:, :, None], 0, 255
+        ).astype(np.uint8)
+        warped_roi[:, :, 3] = np.clip(
+            warped_roi[:, :, 3].astype(np.float32) * pocket_allow, 0, 255
+        ).astype(np.uint8)
 
     # Encode warped ROI as PNG base64
     success, buffer = cv2.imencode(".png", warped_roi)
