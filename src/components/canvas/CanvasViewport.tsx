@@ -190,13 +190,15 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   const [currentMousePos, setCurrentMousePos] = useState<[number, number] | null>(null);
   const [isNearStartPoint, setIsNearStartPoint] = useState<boolean>(false);
   const [isAltPressed, setIsAltPressed] = useState<boolean>(false);
+  const [selectedAnchorIdx, setSelectedAnchorIdx] = useState<number | null>(null);
   const penDragRef = useRef<{
     active: boolean;
     anchorIndex: number;
-    dragType: "create-tangent" | "move-anchor" | "move-handle-in" | "move-handle-out";
+    dragType: "create-tangent" | "move-anchor" | "move-handle-in" | "move-handle-out" | "bend-segment";
     startX: number;
     startY: number;
     initialAnchor?: PenAnchor;
+    initialNextAnchor?: PenAnchor;
   } | null>(null);
 
   // Auto-load saved pen pattern for selected slot when in Pen Tool (allows editing existing patterns)
@@ -222,7 +224,69 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     const defaultAnchors = generateDefaultPenAnchors(activeSlot.bbox);
     setPenAnchors(defaultAnchors);
     setIsPathClosed(true);
+    setSelectedAnchorIdx(0);
   };
+
+  // Toggle smooth curve / sharp corner on an anchor point (e.g. last point or closing point)
+  const toggleAnchorSmooth = useCallback((idx: number) => {
+    setPenAnchors((prev) => {
+      if (!prev[idx]) return prev;
+      const next = [...prev];
+      const anchor = next[idx];
+      const n = next.length;
+      if (n < 2) return prev;
+
+      const hasHandles =
+        Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 2 ||
+        Math.hypot(anchor.handleIn[0] - anchor.x, anchor.handleIn[1] - anchor.y) > 2;
+
+      if (hasHandles) {
+        // Convert smooth curve to sharp corner
+        next[idx] = {
+          ...anchor,
+          handleIn: [anchor.x, anchor.y],
+          handleOut: [anchor.x, anchor.y],
+        };
+      } else {
+        // Convert sharp corner to smooth curve with natural tangent vectors
+        const prevAnchor = next[(idx - 1 + n) % n];
+        const nextAnchor = next[(idx + 1) % n];
+
+        let vx = nextAnchor.x - prevAnchor.x;
+        let vy = nextAnchor.y - prevAnchor.y;
+        let len = Math.hypot(vx, vy);
+        if (len < 1e-3) {
+          vx = 1;
+          vy = 0;
+          len = 1;
+        }
+        const nx = vx / len;
+        const ny = vy / len;
+
+        const dPrev = Math.hypot(anchor.x - prevAnchor.x, anchor.y - prevAnchor.y);
+        const dNext = Math.hypot(nextAnchor.x - anchor.x, nextAnchor.y - anchor.y);
+        const hLenOut = Math.max(16, dNext * 0.33);
+        const hLenIn = Math.max(16, dPrev * 0.33);
+
+        next[idx] = {
+          ...anchor,
+          handleOut: [Math.round(anchor.x + nx * hLenOut), Math.round(anchor.y + ny * hLenOut)],
+          handleIn: [Math.round(anchor.x - nx * hLenIn), Math.round(anchor.y - ny * hLenIn)],
+        };
+      }
+      return next;
+    });
+  }, []);
+
+  // Delete selected anchor point from pen path
+  const deleteSelectedAnchor = useCallback(() => {
+    if (selectedAnchorIdx === null) return;
+    setPenAnchors((prev) => {
+      if (prev.length <= 3) return prev;
+      return prev.filter((_, i) => i !== selectedAnchorIdx);
+    });
+    setSelectedAnchorIdx(null);
+  }, [selectedAnchorIdx]);
 
   const processFile = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -452,6 +516,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     const pt = getSvgPoint(e);
     if (!pt) return;
 
+    setSelectedAnchorIdx(idx);
+
     if (e.altKey || isAltPressed) {
       // Alt-click on an anchor: toggle handles (collapse to sharp corner)
       const anchor = penAnchors[idx];
@@ -486,10 +552,18 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       }
     }
 
-    // Clicking start point when path is open and >= 3 points closes the loop without exiting
+    // Clicking start point when path is open and >= 3 points closes the loop and activates drag curving!
     if (!isPathClosed && idx === 0 && penAnchors.length >= 3) {
       setIsPathClosed(true);
       setIsNearStartPoint(false);
+      setSelectedAnchorIdx(0);
+      penDragRef.current = {
+        active: true,
+        anchorIndex: 0,
+        dragType: "create-tangent",
+        startX: penAnchors[0].x,
+        startY: penAnchors[0].y,
+      };
       return;
     }
 
@@ -524,6 +598,52 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     };
   };
 
+  // Handle clicking/dragging directly on a curve or straight line segment
+  const handleSegmentMouseDown = (e: ReactMouseEvent, segIdx: number) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const pt = getSvgPoint(e);
+    if (!pt) return;
+
+    const curr = penAnchors[segIdx];
+    const nextIdx = (segIdx + 1) % penAnchors.length;
+    const next = penAnchors[nextIdx];
+    if (!curr || !next) return;
+
+    // Check if curr.handleOut or next.handleIn need initial sprout
+    const hasOut = Math.hypot(curr.handleOut[0] - curr.x, curr.handleOut[1] - curr.y) > 2;
+    const hasIn = Math.hypot(next.handleIn[0] - next.x, next.handleIn[1] - next.y) > 2;
+
+    const initHOut: [number, number] = hasOut
+      ? [...curr.handleOut]
+      : [Math.round(curr.x + (next.x - curr.x) * 0.33), Math.round(curr.y + (next.y - curr.y) * 0.33)];
+
+    const initHIn: [number, number] = hasIn
+      ? [...next.handleIn]
+      : [Math.round(next.x - (next.x - curr.x) * 0.33), Math.round(next.y - (next.y - curr.y) * 0.33)];
+
+    penDragRef.current = {
+      active: true,
+      anchorIndex: segIdx,
+      dragType: "bend-segment",
+      startX: pt[0],
+      startY: pt[1],
+      initialAnchor: {
+        x: curr.x,
+        y: curr.y,
+        handleOut: initHOut,
+        handleIn: [...curr.handleIn],
+      },
+      initialNextAnchor: {
+        x: next.x,
+        y: next.y,
+        handleIn: initHIn,
+        handleOut: [...next.handleOut],
+      },
+    };
+    setSelectedAnchorIdx(segIdx);
+  };
+
   // SVG mouse down handler: supports hold-and-drag Photoshop-style Pen Tool curving
   const handleSvgMouseDown = (e: ReactMouseEvent<SVGSVGElement>) => {
     if (e.button === 1 || isSpacePressed || trayState.activeTool === "pan") {
@@ -540,10 +660,18 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       // If loop is already closed, don't add random points on empty click
       if (isPathClosed) return;
 
-      // If clicking near start point and has >= 3 anchors, close the loop!
+      // If clicking near start point and has >= 3 anchors, close loop with hold-drag curve!
       if (penAnchors.length >= 3 && isNearStartPoint) {
         setIsPathClosed(true);
         setIsNearStartPoint(false);
+        setSelectedAnchorIdx(0);
+        penDragRef.current = {
+          active: true,
+          anchorIndex: 0,
+          dragType: "create-tangent",
+          startX: penAnchors[0].x,
+          startY: penAnchors[0].y,
+        };
         return;
       }
 
@@ -557,6 +685,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
       const newIdx = penAnchors.length;
       setPenAnchors((prev) => [...prev, newAnchor]);
+      setSelectedAnchorIdx(newIdx);
       penDragRef.current = {
         active: true,
         anchorIndex: newIdx,
@@ -666,6 +795,25 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
               };
             }
             return next;
+          });
+        } else if (dragType === "bend-segment" && penDragRef.current.initialAnchor && penDragRef.current.initialNextAnchor) {
+          const initA = penDragRef.current.initialAnchor;
+          const initB = penDragRef.current.initialNextAnchor;
+          const nextIdx = (anchorIndex + 1) % penAnchors.length;
+
+          setPenAnchors((prev) => {
+            const nextList = [...prev];
+            if (nextList[anchorIndex] && nextList[nextIdx]) {
+              nextList[anchorIndex] = {
+                ...nextList[anchorIndex],
+                handleOut: [Math.round(initA.handleOut[0] + dx * 0.75), Math.round(initA.handleOut[1] + dy * 0.75)],
+              };
+              nextList[nextIdx] = {
+                ...nextList[nextIdx],
+                handleIn: [Math.round(initB.handleIn[0] + dx * 0.75), Math.round(initB.handleIn[1] + dy * 0.75)],
+              };
+            }
+            return nextList;
           });
         }
         return;
@@ -795,19 +943,46 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         if (pt && penDragRef.current.dragType === "create-tangent") {
           const { anchorIndex, startX, startY } = penDragRef.current;
           const dist = Math.hypot(pt[0] - startX, pt[1] - startY);
-          // If clicked and released with minimal drag (< 4px screen equivalent), treat as sharp corner
+          // If clicked and released with minimal drag (< 4px screen equivalent) on a point without handles, keep as corner
           if (dist < 4 / Math.max(0.3, zoom)) {
-            setPenAnchors((prev) => {
-              const next = [...prev];
-              if (next[anchorIndex]) {
-                next[anchorIndex] = {
-                  ...next[anchorIndex],
-                  handleIn: [next[anchorIndex].x, next[anchorIndex].y],
-                  handleOut: [next[anchorIndex].x, next[anchorIndex].y],
-                };
+            const anchor = penAnchors[anchorIndex];
+            if (anchor) {
+              const alreadyHadHandles =
+                Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 2 ||
+                Math.hypot(anchor.handleIn[0] - anchor.x, anchor.handleIn[1] - anchor.y) > 2;
+              if (!alreadyHadHandles) {
+                setPenAnchors((prev) => {
+                  const next = [...prev];
+                  if (next[anchorIndex]) {
+                    next[anchorIndex] = {
+                      ...next[anchorIndex],
+                      handleIn: [next[anchorIndex].x, next[anchorIndex].y],
+                      handleOut: [next[anchorIndex].x, next[anchorIndex].y],
+                    };
+                  }
+                  return next;
+                });
               }
-              return next;
+            }
+          }
+        } else if (pt && penDragRef.current.dragType === "bend-segment") {
+          const { anchorIndex, startX, startY } = penDragRef.current;
+          const dist = Math.hypot(pt[0] - startX, pt[1] - startY);
+          // If segment was merely clicked (< 4px drag), insert a new anchor point right at cursor!
+          if (dist < 4 / Math.max(0.3, zoom)) {
+            const insertIdx = anchorIndex + 1;
+            const newPt: PenAnchor = {
+              x: Math.round(pt[0]),
+              y: Math.round(pt[1]),
+              handleIn: [Math.round(pt[0]), Math.round(pt[1])],
+              handleOut: [Math.round(pt[0]), Math.round(pt[1])],
+            };
+            setPenAnchors((prev) => {
+              const nextList = [...prev];
+              nextList.splice(insertIdx, 0, newPt);
+              return nextList;
             });
+            setSelectedAnchorIdx(insertIdx);
           }
         }
         penDragRef.current = null;
@@ -886,6 +1061,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     setIsPathClosed(false);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
+    setSelectedAnchorIdx(null);
     penDragRef.current = null;
   };
 
@@ -894,11 +1070,13 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     setIsPathClosed(false);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
+    setSelectedAnchorIdx(null);
     penDragRef.current = null;
     setTrayState((prev) => ({ ...prev, activeTool: "select" }));
   };
 
   const undoLastPenPoint = () => {
+    setSelectedAnchorIdx(null);
     if (isPathClosed) {
       // Re-open closed loop so user can adjust
       setIsPathClosed(false);
@@ -956,9 +1134,14 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           cancelPenDrawing();
         }
       } else if (e.key === "Backspace" || e.key === "Delete") {
-        if (trayState.activeTool === "pen" && penAnchors.length > 0) {
-          e.preventDefault();
-          undoLastPenPoint();
+        if (trayState.activeTool === "pen") {
+          if (selectedAnchorIdx !== null && penAnchors.length > 3) {
+            e.preventDefault();
+            deleteSelectedAnchor();
+          } else if (penAnchors.length > 0) {
+            e.preventDefault();
+            undoLastPenPoint();
+          }
         }
       } else if (e.key === "Enter") {
         if (penAnchors.length >= 3) {
@@ -1370,6 +1553,26 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                             />
                           )}
 
+                          {/* Interactive Curve Segments: Hover to highlight, Drag to bend, Click to insert point */}
+                          {penAnchors.map((anchor, i) => {
+                            if (!isPathClosed && i >= penAnchors.length - 1) return null;
+                            const nextAnchor = penAnchors[(i + 1) % penAnchors.length];
+                            const segD = `M ${anchor.x} ${anchor.y} C ${anchor.handleOut[0]} ${anchor.handleOut[1]}, ${nextAnchor.handleIn[0]} ${nextAnchor.handleIn[1]}, ${nextAnchor.x} ${nextAnchor.y}`;
+                            const screenScale = 1 / Math.max(0.2, zoom);
+                            return (
+                              <path
+                                key={`seg-hit-${i}`}
+                                d={segD}
+                                fill="none"
+                                stroke="transparent"
+                                strokeWidth={Math.max(14, 20 * screenScale)}
+                                strokeLinecap="round"
+                                className="cursor-grab pointer-events-auto hover:stroke-amber-400/50 transition-colors"
+                                onMouseDown={(e) => handleSegmentMouseDown(e, i)}
+                              />
+                            );
+                          })}
+
                           {/* Live Rubberband Bezier Curve to Cursor (Only while path is open) */}
                           {penAnchors.length > 0 && !isPathClosed && currentMousePos && !penDragRef.current?.active && (
                             <path
@@ -1410,6 +1613,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                             const handleRadius = Math.max(3.5, 5 * screenScale);
                             const hitRadius = Math.max(12, 18 * screenScale);
                             const isStart = idx === 0;
+                            const isSelected = selectedAnchorIdx === idx;
                             const isSnapping = !isPathClosed && isStart && isNearStartPoint && penAnchors.length >= 3;
                             const hasOutHandle =
                               Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 1.5;
@@ -1501,6 +1705,14 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       e.preventDefault();
                                       setIsPathClosed(true);
                                       setIsNearStartPoint(false);
+                                      setSelectedAnchorIdx(0);
+                                      penDragRef.current = {
+                                        active: true,
+                                        anchorIndex: 0,
+                                        dragType: "create-tangent",
+                                        startX: penAnchors[0].x,
+                                        startY: penAnchors[0].y,
+                                      };
                                     }}
                                   />
                                 ) : (
@@ -1513,7 +1725,28 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       fill="transparent"
                                       className="cursor-move pointer-events-auto"
                                       onMouseDown={(e) => handleAnchorMouseDown(e, idx)}
+                                      onDoubleClick={(e) => {
+                                        e.stopPropagation();
+                                        toggleAnchorSmooth(idx);
+                                      }}
                                     />
+
+                                    {/* Selected Anchor Pulsing Glow Ring */}
+                                    {isSelected && (
+                                      <rect
+                                        x={anchor.x - halfPt - 3 * screenScale}
+                                        y={anchor.y - halfPt - 3 * screenScale}
+                                        width={ptSize + 6 * screenScale}
+                                        height={ptSize + 6 * screenScale}
+                                        rx={2.5 * screenScale}
+                                        fill="none"
+                                        stroke="#f59e0b"
+                                        strokeWidth={1.5 * screenScale}
+                                        strokeDasharray={`${Math.max(3, 4 * screenScale)},${Math.max(2, 3 * screenScale)}`}
+                                        className="pointer-events-none animate-pulse"
+                                      />
+                                    )}
+
                                     {/* Visible Anchor Square */}
                                     <rect
                                       x={anchor.x - halfPt}
@@ -1521,7 +1754,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       width={ptSize}
                                       height={ptSize}
                                       rx={1.5 * screenScale}
-                                      fill={isStart ? "#f59e0b" : "#ffffff"}
+                                      fill={isSelected ? "#f59e0b" : isStart ? "#fbbf24" : "#ffffff"}
                                       stroke="#171717"
                                       strokeWidth={Math.max(1, 1.5 * screenScale)}
                                       className="pointer-events-none shadow-xs"
@@ -1552,12 +1785,52 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                       </span>
                       <span className="text-[10px] text-neutral-400">
                         {isPathClosed
-                          ? "Drag points or blue handles to tweak curves. Hold Alt to break curve angle."
+                          ? "Drag points, blue handles, or line segments to tweak. Double-click point to curve/sharpen."
                           : "Click & hold-drag to curve. Hold Alt to break handles. Click start point to close loop."}
                       </span>
                     </div>
 
                     <div className="h-6 w-px bg-neutral-800" />
+
+                    {/* Selected Anchor Quick Actions: Curve / Make Corner & Delete Point */}
+                    {selectedAnchorIdx !== null && penAnchors[selectedAnchorIdx] && (
+                      <div className="flex items-center gap-2 bg-neutral-950/80 px-2 py-1 rounded-lg border border-amber-500/30">
+                        <span className="text-[11px] font-semibold text-amber-400">
+                          Point #{selectedAnchorIdx + 1}
+                        </span>
+
+                        <button
+                          onClick={() => toggleAnchorSmooth(selectedAnchorIdx)}
+                          className="px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded text-[11px] font-medium flex items-center gap-1 cursor-pointer transition-all border border-amber-500/40"
+                          title="Toggle between smooth curved tangent handles and sharp corner (or double-click point)"
+                        >
+                          <Sliders className="w-3 h-3 text-amber-400" />
+                          <span>
+                            {Math.hypot(
+                              penAnchors[selectedAnchorIdx].handleOut[0] - penAnchors[selectedAnchorIdx].x,
+                              penAnchors[selectedAnchorIdx].handleOut[1] - penAnchors[selectedAnchorIdx].y
+                            ) > 2 ||
+                            Math.hypot(
+                              penAnchors[selectedAnchorIdx].handleIn[0] - penAnchors[selectedAnchorIdx].x,
+                              penAnchors[selectedAnchorIdx].handleIn[1] - penAnchors[selectedAnchorIdx].y
+                            ) > 2
+                              ? "Make Corner"
+                              : "Curve Point"}
+                          </span>
+                        </button>
+
+                        {penAnchors.length > 3 && (
+                          <button
+                            onClick={deleteSelectedAnchor}
+                            className="px-1.5 py-0.5 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 rounded text-[11px] flex items-center gap-1 cursor-pointer border border-rose-800/40"
+                            title="Delete this anchor point (Del / Backspace)"
+                          >
+                            <X className="w-3 h-3 text-rose-400" />
+                            <span>Delete</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
 
                     {/* Convert Auto-Detection Button (if empty) */}
                     {penAnchors.length === 0 && (
