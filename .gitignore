@@ -1,3 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+test_output/
+test_output_fingers.jpg
+
 # Logs
 logs
 *.log
