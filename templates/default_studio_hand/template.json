@@ -1,0 +1,147 @@
+{
+  "format": "nailtemplate",
+  "version": "1.0.0",
+  "name": "Default Studio Hand",
+  "image_size": [
+    1536,
+    2752
+  ],
+  "files": {
+    "hand_image": "hand.jpg",
+    "cuticle_mask": "cuticle_mask.png",
+    "ao_map": "ao_map.png",
+    "specular_map": "specular_map.png"
+  },
+  "landmarks": {
+    "Thumb": {
+      "c_l": [
+        200.0,
+        1425.0
+      ],
+      "c_c": [
+        236.0,
+        1442.0
+      ],
+      "c_r": [
+        275.0,
+        1416.0
+      ],
+      "d_l": [
+        190.0,
+        1270.0
+      ],
+      "d_r": [
+        268.0,
+        1276.0
+      ],
+      "c_curve": 0.44,
+      "roll_offset": -0.35,
+      "length_scale": 1.0,
+      "tip_taper": 1.0
+    },
+    "Index": {
+      "c_l": [
+        412.0,
+        714.0
+      ],
+      "c_c": [
+        466.0,
+        738.0
+      ],
+      "c_r": [
+        519.0,
+        712.0
+      ],
+      "d_l": [
+        399.0,
+        562.0
+      ],
+      "d_r": [
+        518.0,
+        560.0
+      ],
+      "c_curve": 0.28,
+      "roll_offset": 0.0,
+      "length_scale": 1.0,
+      "tip_taper": 1.0
+    },
+    "Middle": {
+      "c_l": [
+        693.0,
+        566.0
+      ],
+      "c_c": [
+        747.0,
+        592.0
+      ],
+      "c_r": [
+        799.0,
+        566.0
+      ],
+      "d_l": [
+        681.0,
+        410.0
+      ],
+      "d_r": [
+        798.0,
+        410.0
+      ],
+      "c_curve": 0.28,
+      "roll_offset": 0.0,
+      "length_scale": 1.0,
+      "tip_taper": 1.0
+    },
+    "Ring": {
+      "c_l": [
+        948.0,
+        686.0
+      ],
+      "c_c": [
+        1000.0,
+        710.0
+      ],
+      "c_r": [
+        1051.0,
+        686.0
+      ],
+      "d_l": [
+        936.0,
+        540.0
+      ],
+      "d_r": [
+        1048.0,
+        540.0
+      ],
+      "c_curve": 0.28,
+      "roll_offset": 0.0,
+      "length_scale": 1.0,
+      "tip_taper": 1.0
+    },
+    "Pinky": {
+      "c_l": [
+        1222.0,
+        990.0
+      ],
+      "c_c": [
+        1262.0,
+        1012.0
+      ],
+      "c_r": [
+        1301.0,
+        988.0
+      ],
+      "d_l": [
+        1214.0,
+        866.0
+      ],
+      "d_r": [
+        1301.0,
+        864.0
+      ],
+      "c_curve": 0.32,
+      "roll_offset": 0.0,
+      "length_scale": 1.0,
+      "tip_taper": 1.0
+    }
+  }
+}
