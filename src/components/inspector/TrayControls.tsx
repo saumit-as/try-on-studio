@@ -78,6 +78,10 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
     let isMounted = true;
     setIsLoadingPreview(true);
 
+    const isCustomContour =
+      !!(activeSlotData.pen_anchors && activeSlotData.pen_anchors.length > 0) ||
+      !!(trayState.slotPenAnchors?.[selectedSlot] && trayState.slotPenAnchors[selectedSlot].length > 0);
+
     callSidecar<{
       status: string;
       width: number;
@@ -88,6 +92,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
       contour: activeSlotData.contour,
       deskew: true,
       auto_orient_cuticle_down: true,
+      exact_mask: isCustomContour,
     })
       .then((ext) => {
         if (isMounted && ext && ext.status === "ok" && ext.image_base64) {

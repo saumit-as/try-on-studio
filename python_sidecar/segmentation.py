@@ -902,6 +902,7 @@ def extract_nail_rgba(
     auto_orient_cuticle_down: bool = True,
     force_inverted: Optional[bool] = None,
     homography: Optional[np.ndarray] = None,
+    exact_mask: bool = False,
 ) -> np.ndarray:
     """
     Extracts an isolated, 100% solid, B-spline curve-smoothed RGBA nail cutout
@@ -950,6 +951,44 @@ def extract_nail_rgba(
     patch_bgr = working_img[y0:y1, x0:x1].copy()
     ph, pw = patch_bgr.shape[:2]
     local_pts = working_pts - np.array([x0, y0])
+
+    if exact_mask:
+        solid_mask = np.zeros((ph, pw), dtype=np.uint8)
+        cv2.fillPoly(solid_mask, [local_pts], 255)
+        active_cnt = local_pts
+
+        b, g, r = cv2.split(patch_bgr)
+        patch_rgba = cv2.merge([b, g, r, solid_mask])
+
+        if deskew:
+            _, active_cnt, rotated_rgba = deskew_nail_pca(active_cnt, patch_rgba)
+            if rotated_rgba is not None:
+                patch_rgba = rotated_rgba
+
+        alpha = patch_rgba[:, :, 3]
+        ys, xs = np.where(alpha > 12)
+        if len(xs) > 0 and len(ys) > 0:
+            bpad = 4
+            cx0 = max(0, int(np.min(xs)) - bpad)
+            cx1 = min(patch_rgba.shape[1], int(np.max(xs)) + 1 + bpad)
+            cy0 = max(0, int(np.min(ys)) - bpad)
+            cy1 = min(patch_rgba.shape[0], int(np.max(ys)) + 1 + bpad)
+            patch_rgba = patch_rgba[cy0:cy1, cx0:cx1]
+
+        should_invert = force_inverted if force_inverted is not None else is_nail_inverted(active_cnt, patch_rgba=patch_rgba)
+        if auto_orient_cuticle_down and should_invert:
+            patch_rgba = cv2.rotate(patch_rgba, cv2.ROTATE_180)
+        elif should_invert and not auto_orient_cuticle_down:
+            patch_rgba = cv2.rotate(patch_rgba, cv2.ROTATE_180)
+
+        if feather_px > 0:
+            alpha_ch = patch_rgba[:, :, 3].astype(np.float32)
+            blur_alpha = cv2.GaussianBlur(alpha_ch, (0, 0), sigmaX=feather_px, sigmaY=feather_px)
+            core_mask = cv2.erode((alpha_ch > 200).astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+            final_alpha = np.where(core_mask > 0, 255.0, blur_alpha)
+            patch_rgba[:, :, 3] = np.clip(final_alpha, 0, 255).astype(np.uint8)
+
+        return patch_rgba
 
     hull = cv2.convexHull(local_pts)
     hull_mask = np.zeros((ph, pw), dtype=np.uint8)

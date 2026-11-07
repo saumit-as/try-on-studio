@@ -82,6 +82,7 @@ def handle_extract_nail(params):
     feather_px = float(params.get("feather_px", 1.2))
     deskew = bool(params.get("deskew", True))
     auto_orient = bool(params.get("auto_orient_cuticle_down", True))
+    exact_mask = bool(params.get("exact_mask", False))
     homography = None
     if "homography" in params and params["homography"] is not None:
         homography = np.array(params["homography"], dtype=np.float64)
@@ -92,6 +93,7 @@ def handle_extract_nail(params):
         deskew=deskew,
         auto_orient_cuticle_down=auto_orient,
         homography=homography,
+        exact_mask=exact_mask,
     )
 
     # Encode as PNG base64
