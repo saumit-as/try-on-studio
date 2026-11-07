@@ -21,7 +21,13 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from segmentation import segment_packaging_tray, extract_nail_rgba, deskew_nail_pca, classify_nail_shape
+from segmentation import (
+    segment_packaging_tray,
+    extract_nail_rgba,
+    deskew_nail_pca,
+    classify_nail_shape,
+    refit_slot_contour,
+)
 from warping import (
     apply_cylindrical_c_curve,
     build_3tier_control_grid,
@@ -99,6 +105,25 @@ def handle_extract_nail(params):
         "width": int(rgba.shape[1]),
         "height": int(rgba.shape[0]),
         "image_base64": f"data:image/png;base64,{b64_str}",
+    }
+
+
+def handle_refit_slot_contour(params):
+    """
+    Re-fits and extracts a localized nail contour within a user-nudged or resized bounding box.
+    """
+    img = _load_image(params)
+    bbox = params.get("bbox")
+    if not bbox or len(bbox) != 4:
+        raise ValueError("Missing or invalid 'bbox' parameter [x, y, w, h]")
+
+    res = refit_slot_contour(img, bbox)
+    return {
+        "status": "ok",
+        "bbox": res["bbox"],
+        "contour": res["contour"],
+        "pca_angle": res["pca_angle"],
+        "shape_info": res["shape_info"],
     }
 
 
@@ -189,6 +214,7 @@ HANDLERS = {
     "echo": handle_echo,
     "segment_tray": handle_segment_tray,
     "extract_nail": handle_extract_nail,
+    "refit_slot_contour": handle_refit_slot_contour,
     "warp_nail": handle_warp_nail,
 }
 

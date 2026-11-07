@@ -1111,3 +1111,77 @@ def extract_nail_rgba(
 
     patch_rgba[:, :, 3] = sym_alpha
     return patch_rgba
+
+
+def refit_slot_contour(image: np.ndarray, bbox: List[int]) -> Dict[str, Any]:
+    """
+    Refines and extracts the optimal G2-smooth nail contour within a user-specified
+    or manually adjusted bounding box [x, y, w, h].
+    Allows interactive manual adjustment and localized computer vision re-snapping.
+    """
+    h_img, w_img = image.shape[:2]
+    bx, by, bw, bh = [int(v) for v in bbox]
+    pad = 8
+    x0 = max(0, bx - pad)
+    y0 = max(0, by - pad)
+    x1 = min(w_img, bx + bw + pad)
+    y1 = min(h_img, by + bh + pad)
+    roi = image[y0:y1, x0:x1]
+
+    if roi.size == 0 or bw < 10 or bh < 10:
+        cx, cy = bx + bw / 2.0, by + bh / 2.0
+        theta = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+        pts = [[int(cx + (bw / 2.0) * np.cos(t)), int(cy + (bh / 2.0) * np.sin(t))] for t in theta]
+        return {
+            "bbox": [bx, by, bw, bh],
+            "contour": pts,
+            "pca_angle": 0.0,
+            "shape_info": {"shape": "Oval", "confidence": 0.8, "metrics": {}},
+        }
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    sat = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 1]
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    lab_A = lab[:, :, 1]
+    b = roi[:, :, 0].astype(np.float32)
+    g = roi[:, :, 1].astype(np.float32)
+    r = roi[:, :, 2].astype(np.float32)
+    warmth = (r - b) + (r - g)
+
+    cue_chroma = (
+        (gray >= 50)
+        & ((warmth >= 15.0) | (lab_A >= 130.5) | (sat >= 15.0))
+        & (gray < np.percentile(gray, 92) - 4)
+    )
+    k_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(bw * 0.12) | 1), 3))
+    cue_b = cv2.morphologyEx(cue_chroma.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_bridge)
+    fg_closed = cv2.morphologyEx(cue_b, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+
+    cnts, _ = cv2.findContours(fg_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        best_c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(best_c) > 0.20 * float(bw * bh):
+            hull = cv2.convexHull(best_c)
+            global_cnt = hull + np.array([[[x0, y0]]])
+            bx_n, by_n, bw_n, bh_n = cv2.boundingRect(global_cnt)
+            pca_angle, rot_cnt, _ = deskew_nail_pca(global_cnt)
+            shape_info = classify_nail_shape(rot_cnt)
+            return {
+                "bbox": [int(bx_n), int(by_n), int(bw_n), int(bh_n)],
+                "contour": global_cnt.reshape(-1, 2).tolist(),
+                "pca_angle": round(float(pca_angle), 2),
+                "shape_info": shape_info,
+            }
+
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    theta = np.linspace(0, 2 * np.pi, 36, endpoint=False)
+    pts = [[int(cx + (bw * 0.48) * np.cos(t)), int(cy + (bh * 0.49) * np.sin(t))] for t in theta]
+    cnt_arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+    pca_angle, rot_cnt, _ = deskew_nail_pca(cnt_arr)
+    shape_info = classify_nail_shape(rot_cnt)
+    return {
+        "bbox": [bx, by, bw, bh],
+        "contour": pts,
+        "pca_angle": round(float(pca_angle), 2),
+        "shape_info": shape_info,
+    }

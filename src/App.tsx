@@ -42,6 +42,8 @@ export default function App() {
     shapeOverrides: {},
     extractedPreviews: {},
     hoveredSlot: null,
+    isManualEditMode: false,
+    originalSlots: {},
   });
 
   // Check Python sidecar connection

@@ -52,4 +52,6 @@ export interface TrayState {
   shapeOverrides: Record<number, string>;
   extractedPreviews: Record<number, string>;
   hoveredSlot: number | null;
+  isManualEditMode: boolean;
+  originalSlots: Record<number, DetectedSlot>;
 }

@@ -5,6 +5,12 @@ import {
   ChevronDown,
   RotateCcw,
   Loader2,
+  Move,
+  ArrowUp,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  Sliders,
 } from "lucide-react";
 import { FingerName, NailShape, TrayState, DetectedSlot } from "../../types";
 import { callSidecar } from "../../services/sidecar";
@@ -29,6 +35,8 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   setTrayState,
 }) => {
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [isRefitting, setIsRefitting] = useState(false);
+  const [nudgeStep, setNudgeStep] = useState<number>(5);
 
   const {
     selectedSlot,
@@ -38,6 +46,8 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
     shapeOverrides,
     detectedSlots,
     extractedPreviews,
+    isManualEditMode,
+    originalSlots,
   } = trayState;
 
   const activeSlotData: DetectedSlot | undefined = detectedSlots.find(
@@ -105,7 +115,6 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   const handleFingerAssign = (finger: FingerName) => {
     setTrayState((prev) => {
       const nextMapping = { ...prev.slotFinger };
-      // If finger is already assigned elsewhere, unassign it to prevent duplicates
       Object.entries(nextMapping).forEach(([sId, fName]) => {
         if (fName === finger) {
           delete nextMapping[Number(sId)];
@@ -173,6 +182,116 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
         [selectedSlot]: 0,
       },
     }));
+  };
+
+  // Manual Nudge Handler (dx, dy in image pixels)
+  const handleNudge = (dx: number, dy: number) => {
+    if (!activeSlotData) return;
+    const [bx, by, bw, bh] = activeSlotData.bbox;
+    const newBbox: [number, number, number, number] = [bx + dx, by + dy, bw, bh];
+    const newContour = activeSlotData.contour.map(
+      ([x, y]) => [x + dx, y + dy] as [number, number]
+    );
+
+    setTrayState((prev) => ({
+      ...prev,
+      detectedSlots: prev.detectedSlots.map((s) =>
+        s.slot_id === selectedSlot ? { ...s, bbox: newBbox, contour: newContour } : s
+      ),
+      extractedPreviews: {
+        ...prev.extractedPreviews,
+        [selectedSlot]: "",
+      },
+    }));
+  };
+
+  // Manual Scale Handler (deltaW, deltaH)
+  const handleScale = (deltaW: number, deltaH: number) => {
+    if (!activeSlotData) return;
+    const [bx, by, bw, bh] = activeSlotData.bbox;
+    const newBw = Math.max(16, bw + deltaW);
+    const newBh = Math.max(16, bh + deltaH);
+    const newBx = Math.round(bx - (newBw - bw) / 2);
+    const newBy = Math.round(by - (newBh - bh) / 2);
+    const newBbox: [number, number, number, number] = [newBx, newBy, newBw, newBh];
+
+    const newContour = activeSlotData.contour.map(
+      ([x, y]) =>
+        [
+          Math.round(newBx + ((x - bx) / Math.max(1, bw)) * newBw),
+          Math.round(newBy + ((y - by) / Math.max(1, bh)) * newBh),
+        ] as [number, number]
+    );
+
+    setTrayState((prev) => ({
+      ...prev,
+      detectedSlots: prev.detectedSlots.map((s) =>
+        s.slot_id === selectedSlot ? { ...s, bbox: newBbox, contour: newContour } : s
+      ),
+      extractedPreviews: {
+        ...prev.extractedPreviews,
+        [selectedSlot]: "",
+      },
+    }));
+  };
+
+  // Reset current slot to original auto-detected contour
+  const handleResetToAuto = () => {
+    const orig = originalSlots?.[selectedSlot];
+    if (!orig) return;
+    setTrayState((prev) => ({
+      ...prev,
+      detectedSlots: prev.detectedSlots.map((s) =>
+        s.slot_id === selectedSlot ? JSON.parse(JSON.stringify(orig)) : s
+      ),
+      extractedPreviews: {
+        ...prev.extractedPreviews,
+        [selectedSlot]: "",
+      },
+    }));
+  };
+
+  // Re-run CV snapping inside user's manually adjusted bounding box
+  const handleAutoRefit = async () => {
+    if (!trayState.trayImageSrc || !activeSlotData) return;
+    setIsRefitting(true);
+    try {
+      const res = await callSidecar<{
+        status: string;
+        bbox: [number, number, number, number];
+        contour: [number, number][];
+        pca_angle: number;
+        shape_info: { shape: string; confidence: number; metrics: any };
+      }>("refit_slot_contour", {
+        image_base64: trayState.trayImageSrc,
+        bbox: activeSlotData.bbox,
+      });
+
+      if (res && res.status === "ok") {
+        setTrayState((prev) => ({
+          ...prev,
+          detectedSlots: prev.detectedSlots.map((s) =>
+            s.slot_id === selectedSlot
+              ? {
+                  ...s,
+                  bbox: res.bbox,
+                  contour: res.contour,
+                  pca_angle: res.pca_angle,
+                  shape_info: res.shape_info,
+                }
+              : s
+          ),
+          extractedPreviews: {
+            ...prev.extractedPreviews,
+            [selectedSlot]: "",
+          },
+        }));
+      }
+    } catch (e) {
+      console.error("Auto-refit failed:", e);
+    } finally {
+      setIsRefitting(false);
+    }
   };
 
   return (
@@ -314,6 +433,186 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                 PCA Deskew Angle: {activeSlotData.pca_angle.toFixed(1)}°
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manual Selection Modification Section */}
+      {activeSlotData && (
+        <div className="p-3.5 bg-neutral-900/90 rounded-xl border border-neutral-800 space-y-3.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Sliders className="w-3.5 h-3.5 text-amber-400" />
+              <span className="text-xs font-semibold text-neutral-200">
+                Manual Selection Help
+              </span>
+            </div>
+
+            {/* Toggle Interactive Canvas Handles */}
+            <button
+              onClick={() =>
+                setTrayState((prev) => ({
+                  ...prev,
+                  isManualEditMode: !prev.isManualEditMode,
+                }))
+              }
+              className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
+                isManualEditMode
+                  ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
+                  : "bg-neutral-800 hover:bg-neutral-750 border-neutral-700 text-neutral-300"
+              }`}
+            >
+              <Move className="w-2.5 h-2.5" />
+              <span>{isManualEditMode ? "Canvas Handles: ON" : "Canvas Handles: OFF"}</span>
+            </button>
+          </div>
+
+          <p className="text-[11px] text-neutral-400 leading-relaxed">
+            {isManualEditMode
+              ? "Drag handles directly on the canvas to stretch, resize, or reposition the selection box."
+              : "Use the micro-nudge D-pad and dimension adjusters below, or enable Canvas Handles to drag directly."}
+          </p>
+
+          {/* D-Pad Micro-Nudge & Step Toggle */}
+          <div className="space-y-2 pt-1 border-t border-neutral-800/80">
+            <div className="flex items-center justify-between text-xs text-neutral-400">
+              <span className="text-[11px] font-medium text-neutral-300">Position Nudge</span>
+              <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded border border-neutral-800">
+                <button
+                  onClick={() => setNudgeStep(1)}
+                  className={`px-1.5 py-0.5 text-[10px] rounded cursor-pointer ${
+                    nudgeStep === 1
+                      ? "bg-amber-500 text-neutral-950 font-bold"
+                      : "text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  1px
+                </button>
+                <button
+                  onClick={() => setNudgeStep(5)}
+                  className={`px-1.5 py-0.5 text-[10px] rounded cursor-pointer ${
+                    nudgeStep === 5
+                      ? "bg-amber-500 text-neutral-950 font-bold"
+                      : "text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  5px
+                </button>
+              </div>
+            </div>
+
+            {/* D-Pad Buttons */}
+            <div className="flex items-center justify-center">
+              <div className="grid grid-cols-3 gap-1 w-32">
+                <div />
+                <button
+                  onClick={() => handleNudge(0, -nudgeStep)}
+                  className="p-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700 active:bg-amber-500/30 border border-neutral-700 text-neutral-200 flex items-center justify-center cursor-pointer transition-all"
+                  title={`Nudge Up (-${nudgeStep}px)`}
+                >
+                  <ArrowUp className="w-3.5 h-3.5" />
+                </button>
+                <div />
+                <button
+                  onClick={() => handleNudge(-nudgeStep, 0)}
+                  className="p-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700 active:bg-amber-500/30 border border-neutral-700 text-neutral-200 flex items-center justify-center cursor-pointer transition-all"
+                  title={`Nudge Left (-${nudgeStep}px)`}
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                </button>
+                <div className="flex items-center justify-center text-[10px] text-neutral-400 font-mono font-bold">
+                  #{selectedSlot}
+                </div>
+                <button
+                  onClick={() => handleNudge(nudgeStep, 0)}
+                  className="p-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700 active:bg-amber-500/30 border border-neutral-700 text-neutral-200 flex items-center justify-center cursor-pointer transition-all"
+                  title={`Nudge Right (+${nudgeStep}px)`}
+                >
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <div />
+                <button
+                  onClick={() => handleNudge(0, nudgeStep)}
+                  className="p-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700 active:bg-amber-500/30 border border-neutral-700 text-neutral-200 flex items-center justify-center cursor-pointer transition-all"
+                  title={`Nudge Down (+${nudgeStep}px)`}
+                >
+                  <ArrowDown className="w-3.5 h-3.5" />
+                </button>
+                <div />
+              </div>
+            </div>
+          </div>
+
+          {/* Dimension Adjusters */}
+          <div className="space-y-2 pt-1 border-t border-neutral-800/80">
+            <span className="text-[11px] font-medium text-neutral-300">
+              Dimensions & Scale
+            </span>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-neutral-400">Width:</span>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => handleScale(-4, 0)}
+                    className="flex-1 py-1 px-2 rounded bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-300 font-mono text-[11px] cursor-pointer"
+                  >
+                    -4px
+                  </button>
+                  <button
+                    onClick={() => handleScale(4, 0)}
+                    className="flex-1 py-1 px-2 rounded bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-300 font-mono text-[11px] cursor-pointer"
+                  >
+                    +4px
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-neutral-400">Length:</span>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => handleScale(0, -6)}
+                    className="flex-1 py-1 px-2 rounded bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-300 font-mono text-[11px] cursor-pointer"
+                  >
+                    -6px
+                  </button>
+                  <button
+                    onClick={() => handleScale(0, 6)}
+                    className="flex-1 py-1 px-2 rounded bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-300 font-mono text-[11px] cursor-pointer"
+                  >
+                    +6px
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Auto-Refit and Reset Action Buttons */}
+          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-neutral-800/80">
+            <button
+              onClick={handleAutoRefit}
+              disabled={isRefitting}
+              className="py-1.5 px-2.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+            >
+              {isRefitting ? (
+                <>
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span>Snapping...</span>
+                </>
+              ) : (
+                <>
+                  <Wand2 className="w-3 h-3 text-amber-400" />
+                  <span>Re-snap Contour</span>
+                </>
+              )}
+            </button>
+
+            <button
+              onClick={handleResetToAuto}
+              className="py-1.5 px-2.5 rounded-lg bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-neutral-300 hover:text-neutral-100 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3 text-neutral-400" />
+              <span>Reset to Auto</span>
+            </button>
           </div>
         </div>
       )}
