@@ -635,20 +635,33 @@ def segment_packaging_tray(
     roi_sat = sat[ry0:ry0 + rh, rx0:rx0 + rw]
     roi_A = lab_A[ry0:ry0 + rh, rx0:rx0 + rw]
     roi_L = lab_L[ry0:ry0 + rh, rx0:rx0 + rw]
+    roi_bgr = rect_img[ry0:ry0 + rh, rx0:rx0 + rw]
+    roi_b = roi_bgr[:, :, 0].astype(np.float32)
+    roi_g = roi_bgr[:, :, 1].astype(np.float32)
+    roi_r = roi_bgr[:, :, 2].astype(np.float32)
+    roi_warmth = (roi_r - roi_b) + (roi_r - roi_g)
 
     bg_gray = float(np.percentile(roi_gray, 82))
     bg_sat = float(np.percentile(roi_sat, 50))
     bg_A = float(np.percentile(roi_A, 50))
-    sat_thresh = max(18.0, bg_sat + 16.0)
-    A_thresh = max(132.0, bg_A + 2.5)
+    bg_warmth = float(np.percentile(roi_warmth, 50))
+    sat_thresh = max(12.0, bg_sat + 10.0)
+    A_thresh = max(130.5, bg_A + 2.0)
+    warmth_thresh = max(14.0, bg_warmth + 12.0)
 
     # Step 2.1: Multi-cue foreground detection
-    # 1. Chrominance cue (warm pigment, peach, pink, terracotta, gold)
-    cue_chroma = ((roi_A >= A_thresh) | (roi_sat >= sat_thresh)) & (roi_gray < bg_gray - 5)
+    # 1. Chrominance & Warmth cue (warm pigment, peach, pink, terracotta, gold, sheer)
+    # Requires roi_gray >= 35 to reject black cast shadows where HSV saturation numerically spikes
+    cue_chroma = (
+        (roi_gray >= 35)
+        & ((roi_A >= A_thresh) | (roi_sat >= sat_thresh) | (roi_warmth >= warmth_thresh))
+        & (roi_gray < bg_gray - 5)
+    )
     # 2. Dark pigment cue (jet-black French tips, cat-eye crimson, dark art)
-    # Rejects light-grey achromatic cast shadows on the white backing card (gray > 108 with neutral chroma)
-    cue_dark = (roi_gray < 108) | (
-        (roi_gray < bg_gray - 28.0) & ((roi_sat >= bg_sat + 10.0) | (roi_A >= bg_A + 2.0))
+    # Requires chromatic or saturation separation from the white card so achromatic cast shadows are rejected
+    cue_dark = (
+        (roi_gray < bg_gray - 32.0)
+        & ((roi_sat >= bg_sat + 12.0) | (roi_A >= bg_A + 2.5) | (roi_warmth >= bg_warmth + 14.0))
     )
     # Suppress dark cue in the header logo zone where "Nail BERRIE" is printed
     logo_mask = np.zeros((rh, rw), dtype=bool)
@@ -663,7 +676,7 @@ def segment_packaging_tray(
     local_bg = cv2.boxFilter(roi_gray, cv2.CV_32F, (k_bg, k_bg))
     rim_shadow = (roi_gray.astype(np.float32) < local_bg - 6.0)
 
-    pink_base = ((roi_A >= A_thresh) | (roi_sat >= sat_thresh)) & (roi_gray < bg_gray - 5)
+    pink_base = cue_chroma.copy()
     k_down = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(rh * 0.08))))
     pink_col_span = cv2.dilate(pink_base.astype(np.uint8), k_down)
 
@@ -789,6 +802,12 @@ def segment_packaging_tray(
         sp_gray = gray[sy0:sy1, sx0:sx1]
         sp_sat = sat[sy0:sy1, sx0:sx1]
         sp_A = lab_A[sy0:sy1, sx0:sx1]
+        sp_bgr = rect_img[sy0:sy1, sx0:sx1]
+        sp_b = sp_bgr[:, :, 0].astype(np.float32)
+        sp_g = sp_bgr[:, :, 1].astype(np.float32)
+        sp_r = sp_bgr[:, :, 2].astype(np.float32)
+        sp_warmth = (sp_r - sp_b) + (sp_r - sp_g)
+
         sp_hull = np.zeros_like(sp_gray, dtype=np.uint8)
         cv2.fillPoly(sp_hull, [cnt_rect.reshape(-1, 2) - np.array([sx0, sy0])], 255)
         sp_ek = max(5, int(min(sbw, sbh) * 0.22) | 1)
@@ -797,6 +816,7 @@ def segment_packaging_tray(
             c_gray_m = float(np.percentile(sp_gray[sp_core], 50))
             c_sat_p75 = float(np.percentile(sp_sat[sp_core], 75))
             c_A_p75 = float(np.percentile(sp_A[sp_core], 75))
+            c_warmth_p75 = float(np.percentile(sp_warmth[sp_core], 75))
             if c_gray_m < 115.0 and c_sat_p75 > 65.0:
                 eff_s = max(sat_thresh, bg_sat + 0.72 * (c_sat_p75 - bg_sat))
                 eff_a = max(A_thresh, bg_A + 0.72 * (c_A_p75 - bg_A))
@@ -812,6 +832,33 @@ def segment_packaging_tray(
                 if sp_cnts:
                     best_sp = max(sp_cnts, key=cv2.contourArea)
                     if cv2.contourArea(best_sp) > 0.40 * float(sbw * sbh):
+                        cnt_rect = cv2.convexHull(best_sp) + np.array([[[sx0, sy0]]])
+                        rx_n, ry_n, rbw_n, rbh_n = cv2.boundingRect(cnt_rect)
+                        item["gx"], item["gy"], item["bw"], item["bh"] = rx_n, ry_n, rbw_n, rbh_n
+                        item["area"] = float(cv2.contourArea(cnt_rect))
+                        item["aspect"] = rbh_n / float(rbw_n) if rbw_n > 0 else 1.5
+            elif c_warmth_p75 > 15.0 or c_A_p75 > 131.0 or (c_gray_m >= 115.0 and c_sat_p75 > 15.0):
+                eff_w = max(16.0, bg_warmth + 10.0)
+                eff_a = max(130.5, bg_A + 2.0)
+                eff_s = max(12.0, bg_sat + 10.0)
+                sp_fg = (
+                    (sp_gray >= 50)
+                    & ((sp_warmth >= eff_w) | (sp_A >= eff_a) | (sp_sat >= eff_s))
+                    & (sp_gray < bg_gray - 5)
+                )
+                sp_fg_u8 = cv2.bitwise_and(sp_fg.astype(np.uint8) * 255, sp_hull)
+                k_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(sbw * 0.12) | 1), 3))
+                sp_fg_u8 = cv2.morphologyEx(sp_fg_u8, cv2.MORPH_CLOSE, k_bridge)
+                sp_fg_u8 = cv2.morphologyEx(
+                    sp_fg_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                )
+                sp_fg_u8 = cv2.morphologyEx(
+                    sp_fg_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                )
+                sp_cnts, _ = cv2.findContours(sp_fg_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if sp_cnts:
+                    best_sp = max(sp_cnts, key=cv2.contourArea)
+                    if cv2.contourArea(best_sp) > 0.35 * float(sbw * sbh):
                         cnt_rect = cv2.convexHull(best_sp) + np.array([[[sx0, sy0]]])
                         rx_n, ry_n, rbw_n, rbh_n = cv2.boundingRect(cnt_rect)
                         item["gx"], item["gy"], item["bw"], item["bh"] = rx_n, ry_n, rbw_n, rbh_n
@@ -917,18 +964,26 @@ def extract_nail_rgba(
     patch_B = patch_lab[:, :, 2]
     patch_L = patch_lab[:, :, 0]
 
+    patch_b = patch_bgr[:, :, 0].astype(np.float32)
+    patch_g = patch_bgr[:, :, 1].astype(np.float32)
+    patch_r = patch_bgr[:, :, 2].astype(np.float32)
+    patch_warmth = (patch_r - patch_b) + (patch_r - patch_g)
+
     ext_card_pixels = (hull_mask == 0) & (patch_sat < 40) & (patch_gray > 165)
     if np.sum(ext_card_pixels) > 20:
         bg_gray = float(np.percentile(patch_gray[ext_card_pixels], 75))
         bg_sat = float(np.percentile(patch_sat[ext_card_pixels], 50))
         bg_A = float(np.percentile(patch_A[ext_card_pixels], 50))
+        bg_warmth = float(np.percentile(patch_warmth[ext_card_pixels], 50))
     else:
         bg_gray = max(210.0, float(np.percentile(patch_gray, 85)))
         bg_sat = 10.0
         bg_A = 128.0
+        bg_warmth = 0.5
 
     sat_thresh = max(18.0, bg_sat + 16.0)
     A_thresh = max(132.0, bg_A + 2.5)
+    warmth_thresh = max(14.0, bg_warmth + 10.0)
 
     # Measure core nail properties inside the central region of hull_mask
     # When the nail is a dark, richly pigmented nail (e.g. burgundy/espresso with core_gray < 110
@@ -944,18 +999,30 @@ def extract_nail_rgba(
     core_gray_med = float(np.percentile(patch_gray[core_region], 50))
     core_sat_p75 = float(np.percentile(patch_sat[core_region], 75))
     core_A_p75 = float(np.percentile(patch_A[core_region], 75))
+    core_warmth_p75 = float(np.percentile(patch_warmth[core_region], 75))
 
     if core_gray_med < 115.0 and core_sat_p75 > 65.0:
         eff_sat_thresh = max(sat_thresh, bg_sat + 0.72 * (core_sat_p75 - bg_sat))
         eff_A_thresh = max(A_thresh, bg_A + 0.72 * (core_A_p75 - bg_A))
         cue_chroma = ((patch_A >= eff_A_thresh) | (patch_sat >= eff_sat_thresh)) & (patch_gray < bg_gray - 12)
         cue_dark = np.zeros_like(cue_chroma, dtype=bool)
+    elif core_warmth_p75 > 15.0 or core_A_p75 > 131.0 or (core_gray_med >= 115.0 and core_sat_p75 > 15.0):
+        eff_w = max(16.0, bg_warmth + 10.0)
+        eff_a = max(130.5, bg_A + 2.0)
+        eff_s = max(12.0, bg_sat + 10.0)
+        cue_chroma = (
+            (patch_gray >= 50)
+            & ((patch_warmth >= eff_w) | (patch_A >= eff_a) | (patch_sat >= eff_s))
+            & (patch_gray < bg_gray - 5)
+        )
+        cue_dark = np.zeros_like(cue_chroma, dtype=bool)
     else:
         cue_chroma = ((patch_A >= A_thresh) | (patch_sat >= sat_thresh)) & (patch_gray < bg_gray - 5)
         is_dark_nail = np.percentile(patch_gray[core_region], 25) < 95.0
         if is_dark_nail:
-            cue_dark = (patch_gray < 88) | (
-                (patch_gray < bg_gray - 28.0) & ((patch_sat >= bg_sat + 10.0) | (patch_A >= bg_A + 2.0))
+            cue_dark = (
+                (patch_gray < bg_gray - 32.0)
+                & ((patch_sat >= bg_sat + 12.0) | (patch_A >= bg_A + 2.5) | (patch_warmth >= bg_warmth + 14.0))
             )
         else:
             cue_dark = np.zeros_like(cue_chroma, dtype=bool)
@@ -978,18 +1045,20 @@ def extract_nail_rgba(
     fg_raw = np.where((cue_chroma | cue_dark | cue_edge), 255, 0).astype(np.uint8)
     fg_masked = cv2.bitwise_and(fg_raw, hull_mask)
 
+    k_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(w * 0.12) | 1), 3))
+    fg_bridged = cv2.morphologyEx(fg_masked, cv2.MORPH_CLOSE, k_bridge)
+
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    fg_cleaned = cv2.morphologyEx(fg_masked, cv2.MORPH_OPEN, open_k, iterations=1)
+    fg_cleaned = cv2.morphologyEx(fg_bridged, cv2.MORPH_OPEN, open_k, iterations=1)
     fg_closed = cv2.morphologyEx(fg_cleaned, cv2.MORPH_CLOSE, close_k, iterations=1)
 
     ext_cnts, _ = cv2.findContours(fg_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     solid_mask = np.zeros((ph, pw), dtype=np.uint8)
     if len(ext_cnts) > 0:
         main_cnt = max(ext_cnts, key=cv2.contourArea)
-        raw_hull = cv2.convexHull(main_cnt)
-        cv2.drawContours(solid_mask, [raw_hull], -1, 255, thickness=cv2.FILLED)
-        active_cnt = raw_hull
+        cv2.drawContours(solid_mask, [main_cnt], -1, 255, thickness=cv2.FILLED)
+        active_cnt = main_cnt
     else:
         cv2.drawContours(solid_mask, [hull], -1, 255, thickness=cv2.FILLED)
         active_cnt = hull
@@ -1020,9 +1089,13 @@ def extract_nail_rgba(
     should_invert = force_inverted if force_inverted is not None else is_nail_inverted(active_cnt, patch_rgba=patch_rgba)
     if auto_orient_cuticle_down and should_invert:
         patch_rgba = cv2.rotate(patch_rgba, cv2.ROTATE_180)
-
-    # Step 2.2: Data-driven symmetric smooth mask (no forced almond template)
-    sym_alpha = build_symmetric_smooth_nail_mask(patch_rgba[:, :, 3], feather_px=feather_px)
+        sym_alpha = build_symmetric_smooth_nail_mask(patch_rgba[:, :, 3], feather_px=feather_px)
+    elif should_invert and not auto_orient_cuticle_down:
+        temp_mask = cv2.rotate(patch_rgba[:, :, 3], cv2.ROTATE_180)
+        temp_sym = build_symmetric_smooth_nail_mask(temp_mask, feather_px=feather_px)
+        sym_alpha = cv2.rotate(temp_sym, cv2.ROTATE_180)
+    else:
+        sym_alpha = build_symmetric_smooth_nail_mask(patch_rgba[:, :, 3], feather_px=feather_px)
 
     # Step Extra A: Minimal edge-fringe cleanup with zero interior pixel fabrication
     # Inpaint only the outer boundary ring (where sym_alpha > 0 but outside eroded core)
