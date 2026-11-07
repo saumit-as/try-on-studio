@@ -306,6 +306,47 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
     }
   };
 
+  // Re-extract fresh cutout from current contour with exact_mask
+  const handleReExtract = async () => {
+    if (!trayState.trayImageSrc || !activeSlotData) return;
+    setIsLoadingPreview(true);
+    try {
+      const isCustomContour =
+        !!(activeSlotData.pen_anchors && activeSlotData.pen_anchors.length > 0) ||
+        !!(trayState.slotPenAnchors?.[selectedSlot] && trayState.slotPenAnchors[selectedSlot].length > 0);
+
+      const ext = await callSidecar<{
+        status: string;
+        width: number;
+        height: number;
+        image_base64: string;
+      }>("extract_nail", {
+        image_base64: trayState.trayImageSrc,
+        contour: activeSlotData.contour,
+        deskew: true,
+        auto_orient_cuticle_down: !isInverted,
+        exact_mask: isCustomContour || true,
+      });
+
+      if (ext && ext.status === "ok" && ext.image_base64) {
+        const previewUrl = ext.image_base64.startsWith("data:")
+          ? ext.image_base64
+          : `data:image/png;base64,${ext.image_base64}`;
+        setTrayState((prev) => ({
+          ...prev,
+          extractedPreviews: {
+            ...prev.extractedPreviews,
+            [selectedSlot]: previewUrl,
+          },
+        }));
+      }
+    } catch (err) {
+      console.error("Re-extract failed:", err);
+    } finally {
+      setIsLoadingPreview(false);
+    }
+  };
+
   return (
     <div className="p-5 space-y-6 select-none">
       <div>
@@ -852,14 +893,30 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
 
               {/* Action Buttons */}
               <div className="flex items-center justify-between gap-2 pt-1">
-                <button
-                  onClick={handleRotationFlip}
-                  className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-neutral-200 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all"
-                  title="Flip orientation 180°"
-                >
-                  <RotateCw className="w-3.5 h-3.5" />
-                  <span>180° Flip</span>
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={handleRotationFlip}
+                    className="px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-neutral-200 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all"
+                    title="Flip orientation 180°"
+                  >
+                    <RotateCw className="w-3.5 h-3.5" />
+                    <span>180° Flip</span>
+                  </button>
+
+                  <button
+                    onClick={handleReExtract}
+                    disabled={isLoadingPreview}
+                    className="px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-amber-300 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all disabled:opacity-50"
+                    title="Re-extract fresh cutout from current contour (preserves all designs & black tips)"
+                  >
+                    {isLoadingPreview ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                    ) : (
+                      <Wand2 className="w-3.5 h-3.5 text-amber-400" />
+                    )}
+                    <span>Re-extract</span>
+                  </button>
+                </div>
 
                 <div className="flex items-center gap-2">
                   <button
