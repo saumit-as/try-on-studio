@@ -45,12 +45,13 @@ impl SidecarClient {
         }
 
         // 1. Try to find packaged sidecar externalBin first
-        // 2. Fall back to python3 script in dev mode
+        // 2. Fall back to Python script in dev mode (checking venv first)
         let mut command = if let Ok(sidecar_path) = Self::find_sidecar_binary(app) {
             Command::new(sidecar_path)
         } else {
             let script_path = Self::find_dev_script(app);
-            let mut cmd = Command::new("python3");
+            let python_bin = Self::find_python_interpreter();
+            let mut cmd = Command::new(python_bin);
             cmd.arg(script_path);
             cmd
         };
@@ -84,14 +85,69 @@ impl SidecarClient {
     }
 
     fn find_sidecar_binary(app: &AppHandle) -> Result<PathBuf, String> {
-        // In production / packaged app, Tauri places sidecars adjacent or in resource directory
+        let mut search_dirs = Vec::new();
+
+        // 1. App resource directory (Tauri .app/Contents/Resources on macOS, resource folder on Windows/Linux)
         if let Ok(res_dir) = app.path().resource_dir() {
-            let possible_binary = res_dir.join("binaries").join("nail-sidecar");
-            if possible_binary.exists() {
-                return Ok(possible_binary);
+            search_dirs.push(res_dir.clone());
+            search_dirs.push(res_dir.join("binaries"));
+        }
+
+        // 2. Directory containing current executable (.app/Contents/MacOS on macOS, installation root on Windows/Linux)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                search_dirs.push(exe_dir.to_path_buf());
+                search_dirs.push(exe_dir.join("binaries"));
             }
         }
+
+        for dir in search_dirs {
+            let candidates = [
+                dir.join("nail-sidecar.exe"),
+                dir.join("nail-sidecar"),
+            ];
+
+            for candidate in candidates {
+                if candidate.exists() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                    return Ok(candidate);
+                }
+            }
+        }
+
         Err("Packaged binary not found".to_string())
+    }
+
+    fn find_python_interpreter() -> String {
+        // 1. Search for virtual environments relative to current working directory and parent paths
+        #[cfg(target_os = "windows")]
+        let venv_candidates = [
+            ".venv/Scripts/python.exe",
+            "../.venv/Scripts/python.exe",
+            "../../.venv/Scripts/python.exe",
+            "python_sidecar/.venv/Scripts/python.exe",
+        ];
+
+        #[cfg(not(target_os = "windows"))]
+        let venv_candidates = [
+            ".venv/bin/python3",
+            "../.venv/bin/python3",
+            "../../.venv/bin/python3",
+            ".venv/bin/python",
+            "../.venv/bin/python",
+        ];
+
+        for path in venv_candidates {
+            if PathBuf::from(path).exists() {
+                return path.to_string();
+            }
+        }
+
+        // 2. Fall back to system python
+        #[cfg(target_os = "windows")]
+        return "python".to_string();
+
+        #[cfg(not(target_os = "windows"))]
+        return "python3".to_string();
     }
 
     fn find_dev_script(_app: &AppHandle) -> PathBuf {

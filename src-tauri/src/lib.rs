@@ -2,7 +2,7 @@ mod sidecar;
 
 use sidecar::{SidecarClient, SidecarState};
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, State};
+use tauri::State;
 
 #[tauri::command]
 fn call_sidecar(
