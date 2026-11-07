@@ -261,7 +261,7 @@ def extract_nail_rgba(
 ) -> np.ndarray:
     """
     Extracts an isolated RGBA nail cutout from the source image using the contour
-    with sub-pixel anti-aliased edge feathering.
+    with sub-pixel anti-aliased edge feathering and solid body fill.
     """
     pts = np.array(contour, dtype=np.int32).reshape(-1, 2)
     x, y, w, h = cv2.boundingRect(pts)
@@ -278,8 +278,19 @@ def extract_nail_rgba(
     ch, cw = cropped.shape[:2]
 
     shifted_contour = pts - np.array([x0, y0])
+
+    # 1. Fill solid nail body via convex hull of the contour
+    hull = cv2.convexHull(shifted_contour)
     mask = np.zeros((ch, cw), dtype=np.uint8)
-    cv2.fillPoly(mask, [shifted_contour.astype(np.int32)], 255)
+    cv2.fillPoly(mask, [hull], 255)
+
+    # 2. Otsu refinement to exclude bright white/reflective packaging backgrounds around the rim
+    crop_gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    _, otsu_inv = cv2.threshold(crop_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    combined_mask = cv2.bitwise_and(mask, otsu_inv)
+    # If otsu preserved the solid body (>70%), use refined mask
+    if np.count_nonzero(combined_mask) > (np.count_nonzero(mask) * 0.7):
+        mask = combined_mask
 
     if feather_px > 0:
         ksize = int(np.ceil(feather_px * 4)) | 1

@@ -123,60 +123,60 @@ def main():
     # Defined 5-finger landmark targets calibrated for test_assets/hand-template.jpg
     # Format per finger: (cuticle_left, cuticle_center, cuticle_right, distal_left, distal_right)
     finger_targets = [
-        # 1. Thumb (x ≈ 270, y ≈ 1230)
+        # 1. Thumb (nail plate on upper-left of thumb, y=1265 to 1445, angle ~ -18 deg)
         {
             "name": "Thumb",
-            "c_l": (205.0, 1370.0),
-            "c_c": (268.0, 1385.0),
-            "c_r": (330.0, 1370.0),
-            "d_l": (215.0, 1220.0),
-            "d_r": (320.0, 1220.0),
+            "c_l": (200.0, 1435.0),
+            "c_c": (236.0, 1445.0),
+            "c_r": (270.0, 1420.0),
+            "d_l": (200.0, 1270.0),
+            "d_r": (255.0, 1260.0),
             "c_curve": 0.70,
-            "length_scale": 1.25,
+            "length_scale": 1.15,
         },
-        # 2. Index (x ≈ 450, y ≈ 560)
+        # 2. Index (cuticle ~ 730, distal ~ 565)
         {
             "name": "Index",
-            "c_l": (405.0, 710.0),
-            "c_c": (455.0, 725.0),
-            "c_r": (505.0, 710.0),
-            "d_l": (410.0, 565.0),
-            "d_r": (500.0, 565.0),
+            "c_l": (425.0, 725.0),
+            "c_c": (470.0, 735.0),
+            "c_r": (515.0, 720.0),
+            "d_l": (445.0, 570.0),
+            "d_r": (530.0, 565.0),
             "c_curve": 0.65,
-            "length_scale": 1.25,
+            "length_scale": 1.15,
         },
-        # 3. Middle (x ≈ 740, y ≈ 430)
+        # 3. Middle (cuticle ~ 585, distal ~ 415)
         {
             "name": "Middle",
-            "c_l": (690.0, 580.0),
-            "c_c": (740.0, 595.0),
-            "c_r": (790.0, 580.0),
-            "d_l": (695.0, 435.0),
-            "d_r": (785.0, 435.0),
+            "c_l": (705.0, 575.0),
+            "c_c": (750.0, 588.0),
+            "c_r": (795.0, 575.0),
+            "d_l": (715.0, 420.0),
+            "d_r": (800.0, 415.0),
             "c_curve": 0.65,
-            "length_scale": 1.25,
+            "length_scale": 1.15,
         },
-        # 4. Ring (x ≈ 1000, y ≈ 560)
+        # 4. Ring (cuticle ~ 705, distal ~ 545)
         {
             "name": "Ring",
-            "c_l": (950.0, 705.0),
-            "c_c": (1000.0, 720.0),
-            "c_r": (1050.0, 705.0),
-            "d_l": (955.0, 560.0),
-            "d_r": (1045.0, 560.0),
+            "c_l": (960.0, 695.0),
+            "c_c": (1000.0, 708.0),
+            "c_r": (1045.0, 695.0),
+            "d_l": (970.0, 550.0),
+            "d_r": (1050.0, 545.0),
             "c_curve": 0.65,
-            "length_scale": 1.25,
+            "length_scale": 1.15,
         },
-        # 5. Pinky (x ≈ 1260, y ≈ 890)
+        # 5. Pinky (cuticle ~ 1005, distal ~ 870)
         {
             "name": "Pinky",
-            "c_l": (1220.0, 1020.0),
-            "c_c": (1260.0, 1032.0),
-            "c_r": (1300.0, 1020.0),
-            "d_l": (1225.0, 895.0),
-            "d_r": (1295.0, 895.0),
+            "c_l": (1230.0, 1000.0),
+            "c_c": (1265.0, 1010.0),
+            "c_r": (1298.0, 995.0),
+            "d_l": (1235.0, 875.0),
+            "d_r": (1295.0, 870.0),
             "c_curve": 0.70,
-            "length_scale": 1.25,
+            "length_scale": 1.15,
         },
     ]
 
