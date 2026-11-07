@@ -43,11 +43,14 @@ Automates the extraction of press-on nail textures from packaging tray photograp
 - [x] 5-dimension realism scoring agent (`python_sidecar/score_realism_agent.py`) & batch harness (`python_sidecar/test_all_nails.py`)
 
 ### Phase 2: Tray Extractor UI & Interactive Slot Mapping
-- [ ] Connect [`CanvasViewport.tsx`](src/components/canvas/CanvasViewport.tsx) to sidecar `segment_tray`
-- [ ] Interactive SVG/Canvas contour overlays with numbered slot badges
-- [ ] Manual contour vertex editor & drag handles for micro-nudging
-- [ ] Orientation controls (180° flip toggle and fine-rotation wheel)
-- [ ] Drag-and-drop slot-to-finger assignment chips (Thumb, Index, Middle, Ring, Pinky)
+- [x] Connect [`CanvasViewport.tsx`](src/components/canvas/CanvasViewport.tsx) to sidecar `segment_tray`
+- [x] Interactive SVG/Canvas contour overlays with numbered slot badges
+- [x] Drag-and-drop & native file picker photo upload with analysis loader
+- [x] Live deskewed nail cutout thumbnail preview via `extract_nail` JSON-RPC endpoint
+- [x] Manual shape classifier override dropdown with confidence indicators
+- [x] Orientation controls (180° flip toggle and fine-rotation wheel with zero reset)
+- [x] Drag-and-drop slot-to-finger assignment chips (Thumb, Index, Middle, Ring, Pinky)
+- [x] 1-Click "Auto-Map Row 1" mapping preset
 
 ### Phase 3: Hand Template Authoring Wizard & Master Hand
 - [x] Bundled master studio hand photo (`test_assets/hand-template.jpg`) at 1536×2752
