@@ -11,6 +11,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Sliders,
+  PenTool,
 } from "lucide-react";
 import { FingerName, NailShape, TrayState, DetectedSlot } from "../../types";
 import { callSidecar } from "../../services/sidecar";
@@ -448,29 +449,53 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
               </span>
             </div>
 
-            {/* Toggle Interactive Canvas Handles */}
-            <button
-              onClick={() =>
-                setTrayState((prev) => ({
-                  ...prev,
-                  isManualEditMode: !prev.isManualEditMode,
-                }))
-              }
-              className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
-                isManualEditMode
-                  ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
-                  : "bg-neutral-800 hover:bg-neutral-750 border-neutral-700 text-neutral-300"
-              }`}
-            >
-              <Move className="w-2.5 h-2.5" />
-              <span>{isManualEditMode ? "Canvas Handles: ON" : "Canvas Handles: OFF"}</span>
-            </button>
+            <div className="flex items-center gap-1.5">
+              {/* Toggle Pen Tool */}
+              <button
+                onClick={() =>
+                  setTrayState((prev) => ({
+                    ...prev,
+                    activeTool: prev.activeTool === "pen" ? "select" : "pen",
+                  }))
+                }
+                className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
+                  trayState.activeTool === "pen"
+                    ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
+                    : "bg-neutral-800 hover:bg-neutral-750 border-neutral-700 text-neutral-300"
+                }`}
+                title="Draw custom nail contour with Pen Tool"
+              >
+                <PenTool className="w-2.5 h-2.5" />
+                <span>{trayState.activeTool === "pen" ? "Pen: Active" : "Pen Tool"}</span>
+              </button>
+
+              {/* Toggle Interactive Canvas Handles */}
+              <button
+                onClick={() =>
+                  setTrayState((prev) => ({
+                    ...prev,
+                    isManualEditMode: !prev.isManualEditMode,
+                  }))
+                }
+                className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
+                  isManualEditMode
+                    ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
+                    : "bg-neutral-800 hover:bg-neutral-750 border-neutral-700 text-neutral-300"
+                }`}
+                title="Toggle draggable bounding box corner handles on canvas"
+              >
+                <Move className="w-2.5 h-2.5" />
+                <span>{isManualEditMode ? "Handles: ON" : "Handles"}</span>
+              </button>
+            </div>
           </div>
 
           <p className="text-[11px] text-neutral-400 leading-relaxed">
-            {isManualEditMode
+            {trayState.activeTool === "pen"
+              ? "Pen Tool active: click on the canvas around the nail to place points. Click first point or press Enter to finish."
+              : isManualEditMode
               ? "Drag handles directly on the canvas to stretch, resize, or reposition the selection box."
-              : "Use the micro-nudge D-pad and dimension adjusters below, or enable Canvas Handles to drag directly."}
+              : "Use the micro-nudge D-pad, dimension adjusters, or the Pen Tool to draw a custom contour."}
           </p>
 
           {/* D-Pad Micro-Nudge & Step Toggle */}

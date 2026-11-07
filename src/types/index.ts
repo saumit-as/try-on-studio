@@ -54,4 +54,5 @@ export interface TrayState {
   hoveredSlot: number | null;
   isManualEditMode: boolean;
   originalSlots: Record<number, DetectedSlot>;
+  activeTool: "select" | "pen" | "pan";
 }

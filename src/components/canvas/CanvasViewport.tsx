@@ -1,13 +1,30 @@
-import React, { useRef, useState, useEffect, DragEvent, ChangeEvent } from "react";
+import React, {
+  useRef,
+  useState,
+  useEffect,
+  useCallback,
+  DragEvent,
+  ChangeEvent,
+  WheelEvent,
+  MouseEvent as ReactMouseEvent,
+} from "react";
 import {
   Sparkles,
-  Hand,
   Download,
   Upload,
   Loader2,
   AlertCircle,
   RotateCw,
   Sliders,
+  ZoomIn,
+  ZoomOut,
+  Maximize,
+  MousePointer,
+  PenTool,
+  Hand,
+  Undo2,
+  Check,
+  X,
 } from "lucide-react";
 import { ActiveTab, TrayState, DetectedSlot, FingerName } from "../../types";
 import { callSidecar } from "../../services/sidecar";
@@ -47,9 +64,23 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   setTrayState,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragState = useRef<DragState | null>(null);
+
   const [isDragOver, setIsDragOver] = useState(false);
+
+  // Pan & Zoom Engine State
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState<boolean>(false);
+  const panStartRef = useRef<{ startX: number; startY: number; initPanX: number; initPanY: number } | null>(null);
+  const [isSpacePressed, setIsSpacePressed] = useState<boolean>(false);
+
+  // Pen Tool Drawing State
+  const [penPoints, setPenPoints] = useState<[number, number][]>([]);
+  const [currentMousePos, setCurrentMousePos] = useState<[number, number] | null>(null);
+  const [isNearStartPoint, setIsNearStartPoint] = useState<boolean>(false);
 
   const processFile = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -76,7 +107,13 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         selectedSlot: 1,
         isManualEditMode: false,
         originalSlots: {},
+        activeTool: "select",
       }));
+
+      // Reset zoom & pan on new image
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      setPenPoints([]);
 
       try {
         const res = await callSidecar<{
@@ -110,6 +147,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
             slotFinger: defaultMapping,
             originalSlots: origSlotsMap,
             isManualEditMode: false,
+            activeTool: "select",
           }));
 
           if (res.slots.length > 0) {
@@ -188,32 +226,63 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   };
 
   const handleSlotClick = (slot: DetectedSlot) => {
-    if (dragState.current) return;
+    if (dragState.current || trayState.activeTool === "pen") return;
     setTrayState((prev) => ({ ...prev, selectedSlot: slot.slot_id }));
     if (!trayState.extractedPreviews[slot.slot_id] && trayState.trayImageSrc) {
       fetchNailPreview(trayState.trayImageSrc, slot);
     }
   };
 
-  // Convert screen client coordinates to SVG viewBox coordinates
-  const getSvgPoint = (e: React.MouseEvent | MouseEvent): [number, number] | null => {
-    if (!svgRef.current) return null;
-    const svg = svgRef.current;
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX;
-    pt.y = e.clientY;
-    const ctm = svg.getScreenCTM();
-    if (!ctm) return null;
-    const transformed = pt.matrixTransform(ctm.inverse());
-    return [transformed.x, transformed.y];
+  // Convert client cursor coordinates into image-space coordinates via SVG matrix transform
+  const getSvgPoint = useCallback(
+    (e: ReactMouseEvent | MouseEvent): [number, number] | null => {
+      if (!svgRef.current) return null;
+      const svg = svgRef.current;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return null;
+      const transformed = pt.matrixTransform(ctm.inverse());
+      return [transformed.x, transformed.y];
+    },
+    []
+  );
+
+  // Wheel Zoom Engine (smooth, clamping 0.3x to 6.0x)
+  const handleWheel = (e: WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 0.87;
+    setZoom((prev) => Math.min(6.0, Math.max(0.3, Number((prev * factor).toFixed(2)))));
   };
 
+  // Zoom control buttons
+  const handleZoomIn = () => setZoom((prev) => Math.min(6.0, Number((prev * 1.25).toFixed(2))));
+  const handleZoomOut = () => setZoom((prev) => Math.max(0.3, Number((prev * 0.8).toFixed(2))));
+  const handleZoomReset = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Start panning viewport
+  const startPan = (clientX: number, clientY: number) => {
+    setIsPanning(true);
+    panStartRef.current = {
+      startX: clientX,
+      startY: clientY,
+      initPanX: pan.x,
+      initPanY: pan.y,
+    };
+  };
+
+  // Start dragging a slot or handle
   const startDrag = (
-    e: React.MouseEvent,
+    e: ReactMouseEvent,
     mode: "move" | "resize" | "landmark",
     handle?: string,
     landmarkIdx?: number
   ) => {
+    if (trayState.activeTool === "pen" || isSpacePressed) return;
     e.stopPropagation();
     e.preventDefault();
     const pt = getSvgPoint(e);
@@ -234,10 +303,26 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     };
   };
 
-  const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!dragState.current) return;
+  // Svg mouse move handler: handles transform drag and Pen tool preview
+  const handleSvgMouseMove = (e: ReactMouseEvent<SVGSVGElement>) => {
     const pt = getSvgPoint(e);
     if (!pt) return;
+
+    // 1. Pen tool active: track live cursor and check snapping to start point
+    if (trayState.activeTool === "pen") {
+      setCurrentMousePos(pt);
+      if (penPoints.length >= 3) {
+        const snapRadius = Math.max(16, (trayState.trayImageSize?.[0] || 1000) * 0.02) / zoom;
+        const d = Math.hypot(pt[0] - penPoints[0][0], pt[1] - penPoints[0][1]);
+        setIsNearStartPoint(d <= snapRadius);
+      } else {
+        setIsNearStartPoint(false);
+      }
+      return;
+    }
+
+    // 2. Selection transform drag active
+    if (!dragState.current) return;
 
     const { mode, handle, landmarkIdx, startX, startY, origBbox, origContour } =
       dragState.current;
@@ -341,6 +426,78 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     }
   };
 
+  // Pen tool point click handler
+  const handleSvgClick = (e: ReactMouseEvent<SVGSVGElement>) => {
+    if (trayState.activeTool !== "pen") return;
+    const pt = getSvgPoint(e);
+    if (!pt) return;
+
+    // Check if clicking near first point to close path
+    if (penPoints.length >= 3 && isNearStartPoint) {
+      finishPenPath();
+      return;
+    }
+
+    setPenPoints((prev) => [...prev, [Math.round(pt[0]), Math.round(pt[1])]]);
+  };
+
+  // Complete and apply custom pen drawn contour
+  const finishPenPath = () => {
+    if (penPoints.length < 3) return;
+
+    const xs = penPoints.map((p) => p[0]);
+    const ys = penPoints.map((p) => p[1]);
+    const minX = Math.round(Math.min(...xs));
+    const minY = Math.round(Math.min(...ys));
+    const maxX = Math.round(Math.max(...xs));
+    const maxY = Math.round(Math.max(...ys));
+    const bw = Math.max(16, maxX - minX);
+    const bh = Math.max(16, maxY - minY);
+    const newBbox: [number, number, number, number] = [minX, minY, bw, bh];
+
+    setTrayState((prev) => {
+      const updatedSlots = prev.detectedSlots.map((s) =>
+        s.slot_id === prev.selectedSlot
+          ? {
+              ...s,
+              bbox: newBbox,
+              contour: penPoints,
+            }
+          : s
+      );
+
+      const activeSlot = updatedSlots.find((s) => s.slot_id === prev.selectedSlot);
+      if (activeSlot && prev.trayImageSrc) {
+        fetchNailPreview(prev.trayImageSrc, activeSlot);
+      }
+
+      return {
+        ...prev,
+        detectedSlots: updatedSlots,
+        extractedPreviews: {
+          ...prev.extractedPreviews,
+          [prev.selectedSlot]: "",
+        },
+        activeTool: "select",
+      };
+    });
+
+    setPenPoints([]);
+    setCurrentMousePos(null);
+    setIsNearStartPoint(false);
+  };
+
+  const cancelPenDrawing = () => {
+    setPenPoints([]);
+    setCurrentMousePos(null);
+    setIsNearStartPoint(false);
+    setTrayState((prev) => ({ ...prev, activeTool: "select" }));
+  };
+
+  const undoLastPenPoint = () => {
+    setPenPoints((prev) => prev.slice(0, -1));
+  };
+
   const endDrag = () => {
     if (!dragState.current) return;
     dragState.current = null;
@@ -362,18 +519,104 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     });
   };
 
+  // Keyboard shortcut listeners (Space for pan, P for pen, V for select, Esc/Backspace)
   useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+      if (e.code === "Space" && !e.repeat) {
+        setIsSpacePressed(true);
+      } else if (e.key === "p" || e.key === "P") {
+        setTrayState((prev) => ({ ...prev, activeTool: "pen" }));
+      } else if (e.key === "v" || e.key === "V") {
+        setTrayState((prev) => ({ ...prev, activeTool: "select" }));
+      } else if (e.key === "h" || e.key === "H") {
+        setTrayState((prev) => ({ ...prev, activeTool: "pan" }));
+      } else if (e.key === "Escape") {
+        if (penPoints.length > 0) {
+          cancelPenDrawing();
+        }
+      } else if (e.key === "Backspace" || e.key === "Delete") {
+        if (penPoints.length > 0) {
+          undoLastPenPoint();
+        }
+      } else if (e.key === "Enter") {
+        if (penPoints.length >= 3) {
+          finishPenPath();
+        }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        setIsSpacePressed(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [penPoints, setTrayState]);
+
+  // Global mouse listeners for panning and ending drags outside the SVG
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (isPanning && panStartRef.current) {
+        const dx = e.clientX - panStartRef.current.startX;
+        const dy = e.clientY - panStartRef.current.startY;
+        setPan({
+          x: panStartRef.current.initPanX + dx,
+          y: panStartRef.current.initPanY + dy,
+        });
+      }
+    };
+
     const handleGlobalMouseUp = () => {
+      if (isPanning) {
+        setIsPanning(false);
+        panStartRef.current = null;
+      }
       if (dragState.current) {
         endDrag();
       }
     };
+
+    window.addEventListener("mousemove", handleGlobalMouseMove);
     window.addEventListener("mouseup", handleGlobalMouseUp);
-    return () => window.removeEventListener("mouseup", handleGlobalMouseUp);
-  }, []);
+    return () => {
+      window.removeEventListener("mousemove", handleGlobalMouseMove);
+      window.removeEventListener("mouseup", handleGlobalMouseUp);
+    };
+  }, [isPanning]);
+
+  const handleContainerMouseDown = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (e.button === 1 || isSpacePressed || trayState.activeTool === "pan") {
+      e.preventDefault();
+      startPan(e.clientX, e.clientY);
+    }
+  };
+
+  const isPanModeActive = isSpacePressed || trayState.activeTool === "pan";
 
   return (
-    <div className="flex-1 h-full flex flex-col bg-neutral-950 relative overflow-hidden">
+    <div
+      ref={containerRef}
+      onWheel={handleWheel}
+      onMouseDown={handleContainerMouseDown}
+      className={`flex-1 h-full flex flex-col bg-neutral-950 relative overflow-hidden select-none ${
+        isPanModeActive
+          ? isPanning
+            ? "cursor-grabbing"
+            : "cursor-grab"
+          : trayState.activeTool === "pen"
+          ? "cursor-crosshair"
+          : "cursor-default"
+      }`}
+    >
       {/* Hidden File Input */}
       <input
         type="file"
@@ -383,11 +626,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         className="hidden"
       />
 
-      {/* Main Canvas Viewport Area */}
+      {/* Main Viewport Content Area */}
       <div className="flex-1 w-full h-full flex items-center justify-center p-6 relative">
-        {/* Render Tab Contents */}
         {activeTab === "tray" && (
-          <div className="w-full h-full flex items-center justify-center">
+          <div className="w-full h-full flex items-center justify-center relative">
             {!trayState.trayImageSrc ? (
               /* Empty Upload Dropzone */
               <div
@@ -409,15 +651,15 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                 </h3>
                 <p className="text-xs text-neutral-400 max-w-md mb-4 leading-relaxed">
                   Drag and drop your press-on packaging photo, or click to browse files.
-                  Our CV engine will automatically isolate slots, deskew angles, and fit $G^2$ almond/coffin contours.
+                  Use Pan & Zoom and the Pen Tool to customize any nail contour.
                 </p>
                 <button className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 text-xs font-semibold rounded-xl shadow-lg shadow-amber-500/20 transition-all cursor-pointer">
                   Browse Files
                 </button>
               </div>
             ) : (
-              /* Active Tray Canvas with Interactive SVG Contour Overlay */
-              <div className="w-full h-full flex items-center justify-center relative">
+              /* Active Tray Canvas with Pan & Zoom Transform Matrix */
+              <div className="w-full h-full flex items-center justify-center relative overflow-hidden">
                 {trayState.isSegmenting && (
                   <div className="absolute inset-0 z-50 bg-neutral-950/75 backdrop-blur-sm flex flex-col items-center justify-center rounded-2xl">
                     <Loader2 className="w-10 h-10 animate-spin text-amber-500 mb-3" />
@@ -425,7 +667,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                       Analyzing Tray Photo & Segmenting Slots...
                     </p>
                     <p className="text-xs text-neutral-400 mt-1">
-                      Detecting contours, card homography & $G^2$ continuous super-ellipses
+                      Detecting contours, card homography & G2 continuous super-ellipses
                     </p>
                   </div>
                 )}
@@ -443,8 +685,15 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                   </div>
                 )}
 
-                {/* Tray Image & SVG Contour Overlay */}
-                <div className="relative max-w-full max-h-full flex items-center justify-center shadow-lg rounded-xl overflow-hidden border border-neutral-800">
+                {/* Transform Container with Pan and Zoom */}
+                <div
+                  style={{
+                    transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                    transformOrigin: "center center",
+                    transition: isPanning ? "none" : "transform 0.05s ease-out",
+                  }}
+                  className="relative max-w-full max-h-full flex items-center justify-center shadow-2xl rounded-xl overflow-visible border border-neutral-800/80"
+                >
                   <img
                     src={trayState.trayImageSrc}
                     alt="Packaging Tray"
@@ -457,9 +706,11 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                       className="absolute inset-0 w-full h-full select-none"
                       viewBox={`0 0 ${trayState.trayImageSize[0]} ${trayState.trayImageSize[1]}`}
                       preserveAspectRatio="xMidYMid meet"
+                      onClick={handleSvgClick}
                       onMouseMove={handleSvgMouseMove}
                       onMouseUp={endDrag}
                     >
+                      {/* Detected Slot Contours */}
                       {trayState.detectedSlots.map((slot, index) => {
                         const isSelected = trayState.selectedSlot === slot.slot_id;
                         const isHovered = trayState.hoveredSlot === slot.slot_id;
@@ -473,14 +724,12 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                         const centerY = by + bh / 2;
                         const assignedFinger = trayState.slotFinger[slot.slot_id];
 
-                        // Calculate dynamic handle size relative to image resolution
                         const handleSize = Math.max(
                           10,
                           Math.round((trayState.trayImageSize?.[0] || 1500) * 0.01)
                         );
                         const halfHandle = handleSize / 2;
 
-                        // Key contour landmark indices for vertex editing:
                         let cuticleIdx = 0;
                         let tipIdx = 0;
                         let leftIdx = 0;
@@ -511,9 +760,13 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                 hoveredSlot: null,
                               }))
                             }
-                            className="cursor-pointer transition-all"
+                            className={`${
+                              trayState.activeTool === "pen"
+                                ? "pointer-events-none"
+                                : "cursor-pointer"
+                            } transition-all`}
                           >
-                            {/* Glowing Contour Polygon */}
+                            {/* Contour Polygon */}
                             <polygon
                               points={pointsString}
                               fill={
@@ -554,112 +807,215 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                               </text>
                             </g>
 
-                            {/* Interactive Manual Adjustment Transform Box & Handles */}
-                            {trayState.isManualEditMode && isSelected && (
-                              <g className="manual-edit-transform-box">
-                                {/* Dashed bounding box outline */}
-                                <rect
-                                  x={bx}
-                                  y={by}
-                                  width={bw}
-                                  height={bh}
-                                  fill="rgba(245, 158, 11, 0.05)"
-                                  stroke="#f59e0b"
-                                  strokeWidth="2"
-                                  strokeDasharray="6,4"
-                                  className="pointer-events-none"
-                                />
-
-                                {/* Center Drag Move Area */}
-                                <g
-                                  transform={`translate(${centerX}, ${by - 18})`}
-                                  onMouseDown={(e) => startDrag(e, "move")}
-                                  className="cursor-move"
-                                >
+                            {/* Manual Selection Bounding Box & Handles */}
+                            {trayState.isManualEditMode &&
+                              isSelected &&
+                              trayState.activeTool !== "pen" && (
+                                <g className="manual-edit-transform-box">
                                   <rect
-                                    x="-28"
-                                    y="-9"
-                                    width="56"
-                                    height="18"
-                                    rx="9"
-                                    fill="#f59e0b"
-                                    stroke="#ffffff"
-                                    strokeWidth="1.5"
+                                    x={bx}
+                                    y={by}
+                                    width={bw}
+                                    height={bh}
+                                    fill="rgba(245, 158, 11, 0.05)"
+                                    stroke="#f59e0b"
+                                    strokeWidth="2"
+                                    strokeDasharray="6,4"
+                                    className="pointer-events-none"
                                   />
-                                  <text
-                                    textAnchor="middle"
-                                    dominantBaseline="central"
-                                    fill="#000000"
-                                    fontSize="9"
-                                    fontWeight="bold"
-                                    fontFamily="sans-serif"
+
+                                  <g
+                                    transform={`translate(${centerX}, ${by - 18})`}
+                                    onMouseDown={(e) => startDrag(e, "move")}
+                                    className="cursor-move"
                                   >
-                                    DRAG
-                                  </text>
-                                </g>
-
-                                {/* 8 Bounding Box Resize Handles */}
-                                {[
-                                  { id: "nw", x: bx, y: by, cursor: "nwse-resize" },
-                                  { id: "n", x: bx + bw / 2, y: by, cursor: "ns-resize" },
-                                  { id: "ne", x: bx + bw, y: by, cursor: "nesw-resize" },
-                                  { id: "e", x: bx + bw, y: by + bh / 2, cursor: "ew-resize" },
-                                  { id: "se", x: bx + bw, y: by + bh, cursor: "nwse-resize" },
-                                  { id: "s", x: bx + bw / 2, y: by + bh, cursor: "ns-resize" },
-                                  { id: "sw", x: bx, y: by + bh, cursor: "nesw-resize" },
-                                  { id: "w", x: bx, y: by + bh / 2, cursor: "ew-resize" },
-                                ].map((h) => (
-                                  <rect
-                                    key={h.id}
-                                    x={h.x - halfHandle}
-                                    y={h.y - halfHandle}
-                                    width={handleSize}
-                                    height={handleSize}
-                                    rx="2.5"
-                                    fill="#f59e0b"
-                                    stroke="#ffffff"
-                                    strokeWidth="1.5"
-                                    style={{ cursor: h.cursor }}
-                                    onMouseDown={(e) => startDrag(e, "resize", h.id)}
-                                  />
-                                ))}
-
-                                {/* Key Landmark Control Anchors */}
-                                {[
-                                  { name: "cuticle", idx: cuticleIdx, label: "C" },
-                                  { name: "tip", idx: tipIdx, label: "T" },
-                                  { name: "left", idx: leftIdx, label: "L" },
-                                  { name: "right", idx: rightIdx, label: "R" },
-                                ].map((lm) => {
-                                  const pt = slot.contour[lm.idx];
-                                  if (!pt) return null;
-                                  return (
-                                    <circle
-                                      key={lm.name}
-                                      cx={pt[0]}
-                                      cy={pt[1]}
-                                      r={handleSize * 0.65}
-                                      fill="#06b6d4"
+                                    <rect
+                                      x="-28"
+                                      y="-9"
+                                      width="56"
+                                      height="18"
+                                      rx="9"
+                                      fill="#f59e0b"
                                       stroke="#ffffff"
-                                      strokeWidth="2"
-                                      className="cursor-crosshair shadow-sm hover:scale-125 transition-transform"
-                                      onMouseDown={(e) =>
-                                        startDrag(e, "landmark", undefined, lm.idx)
-                                      }
+                                      strokeWidth="1.5"
                                     />
-                                  );
-                                })}
-                              </g>
-                            )}
+                                    <text
+                                      textAnchor="middle"
+                                      dominantBaseline="central"
+                                      fill="#000000"
+                                      fontSize="9"
+                                      fontWeight="bold"
+                                      fontFamily="sans-serif"
+                                    >
+                                      DRAG
+                                    </text>
+                                  </g>
+
+                                  {[
+                                    { id: "nw", x: bx, y: by, cursor: "nwse-resize" },
+                                    { id: "n", x: bx + bw / 2, y: by, cursor: "ns-resize" },
+                                    { id: "ne", x: bx + bw, y: by, cursor: "nesw-resize" },
+                                    { id: "e", x: bx + bw, y: by + bh / 2, cursor: "ew-resize" },
+                                    { id: "se", x: bx + bw, y: by + bh, cursor: "nwse-resize" },
+                                    { id: "s", x: bx + bw / 2, y: by + bh, cursor: "ns-resize" },
+                                    { id: "sw", x: bx, y: by + bh, cursor: "nesw-resize" },
+                                    { id: "w", x: bx, y: by + bh / 2, cursor: "ew-resize" },
+                                  ].map((h) => (
+                                    <rect
+                                      key={h.id}
+                                      x={h.x - halfHandle}
+                                      y={h.y - halfHandle}
+                                      width={handleSize}
+                                      height={handleSize}
+                                      rx="2.5"
+                                      fill="#f59e0b"
+                                      stroke="#ffffff"
+                                      strokeWidth="1.5"
+                                      style={{ cursor: h.cursor }}
+                                      onMouseDown={(e) => startDrag(e, "resize", h.id)}
+                                    />
+                                  ))}
+
+                                  {[
+                                    { name: "cuticle", idx: cuticleIdx, label: "C" },
+                                    { name: "tip", idx: tipIdx, label: "T" },
+                                    { name: "left", idx: leftIdx, label: "L" },
+                                    { name: "right", idx: rightIdx, label: "R" },
+                                  ].map((lm) => {
+                                    const pt = slot.contour[lm.idx];
+                                    if (!pt) return null;
+                                    return (
+                                      <circle
+                                        key={lm.name}
+                                        cx={pt[0]}
+                                        cy={pt[1]}
+                                        r={handleSize * 0.65}
+                                        fill="#06b6d4"
+                                        stroke="#ffffff"
+                                        strokeWidth="2"
+                                        className="cursor-crosshair shadow-sm hover:scale-125 transition-transform"
+                                        onMouseDown={(e) =>
+                                          startDrag(e, "landmark", undefined, lm.idx)
+                                        }
+                                      />
+                                    );
+                                  })}
+                                </g>
+                              )}
                           </g>
                         );
                       })}
+
+                      {/* Pen Tool Interactive Path Rendering */}
+                      {penPoints.length > 0 && (
+                        <g className="pen-tool-layer pointer-events-none">
+                          {/* Closed/filled preview polygon if >= 3 points */}
+                          {penPoints.length >= 3 && (
+                            <polygon
+                              points={penPoints.map((pt) => `${pt[0]},${pt[1]}`).join(" ")}
+                              fill="rgba(245, 158, 11, 0.20)"
+                              stroke="none"
+                            />
+                          )}
+
+                          {/* Polyline connecting placed points */}
+                          <polyline
+                            points={penPoints.map((pt) => `${pt[0]},${pt[1]}`).join(" ")}
+                            fill="none"
+                            stroke="#f59e0b"
+                            strokeWidth="3"
+                            strokeLinejoin="round"
+                            strokeLinecap="round"
+                          />
+
+                          {/* Elastic dashed preview line to current cursor */}
+                          {currentMousePos && (
+                            <line
+                              x1={penPoints[penPoints.length - 1][0]}
+                              y1={penPoints[penPoints.length - 1][1]}
+                              x2={
+                                isNearStartPoint ? penPoints[0][0] : currentMousePos[0]
+                              }
+                              y2={
+                                isNearStartPoint ? penPoints[0][1] : currentMousePos[1]
+                              }
+                              stroke={isNearStartPoint ? "#10b981" : "#f59e0b"}
+                              strokeWidth="2.5"
+                              strokeDasharray="6,4"
+                            />
+                          )}
+
+                          {/* Placed vertex circles */}
+                          {penPoints.map((pt, idx) => {
+                            const isStart = idx === 0;
+                            const isSnapping = isStart && isNearStartPoint;
+                            return (
+                              <circle
+                                key={idx}
+                                cx={pt[0]}
+                                cy={pt[1]}
+                                r={
+                                  isSnapping
+                                    ? 8
+                                    : Math.max(
+                                        4,
+                                        Math.round(
+                                          (trayState.trayImageSize?.[0] || 1500) *
+                                            0.005
+                                        )
+                                      )
+                                }
+                                fill={isSnapping ? "#10b981" : isStart ? "#f59e0b" : "#ffffff"}
+                                stroke={isSnapping ? "#ffffff" : "#171717"}
+                                strokeWidth="2"
+                                className={isSnapping ? "animate-pulse" : ""}
+                              />
+                            );
+                          })}
+                        </g>
+                      )}
                     </svg>
                   )}
                 </div>
 
-                {/* Floating Action Controls */}
+                {/* Floating Pen Tool Active Help Banner */}
+                {trayState.activeTool === "pen" && (
+                  <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 backdrop-blur-md px-4 py-2 rounded-xl border border-amber-500/50 shadow-2xl flex items-center gap-3 text-xs text-neutral-200">
+                    <div className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-ping" />
+                    <span className="font-medium">
+                      Pen Tool Active: Click around Slot #{trayState.selectedSlot} ({penPoints.length} points placed)
+                    </span>
+                    <span className="text-neutral-500">|</span>
+                    <button
+                      onClick={finishPenPath}
+                      disabled={penPoints.length < 3}
+                      className="px-2 py-0.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-neutral-950 rounded font-semibold text-[11px] flex items-center gap-1 cursor-pointer transition-all"
+                    >
+                      <Check className="w-3 h-3" />
+                      <span>Complete Path</span>
+                    </button>
+                    {penPoints.length > 0 && (
+                      <button
+                        onClick={undoLastPenPoint}
+                        className="px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                      >
+                        <Undo2 className="w-3 h-3" />
+                        <span>Undo Point</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={cancelPenDrawing}
+                      className="p-1 hover:text-rose-400 text-neutral-400 cursor-pointer"
+                      title="Cancel (Esc)"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                {/* Floating Viewport Toolbar (Zoom, Pan, Pen, Selection) */}
                 <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between text-xs text-neutral-300 bg-neutral-900/85 backdrop-blur-md px-4 py-2 rounded-xl border border-neutral-800 shadow-xl">
+                  {/* Slots isolated readout */}
                   <div className="flex items-center gap-3">
                     <span className="font-semibold text-neutral-200">
                       {trayState.detectedSlots.length} Slots Isolated
@@ -670,7 +1026,90 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                     </span>
                   </div>
 
+                  {/* Middle: Tool Switcher (Select, Pen Tool, Pan) */}
+                  <div className="flex items-center bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+                    <button
+                      onClick={() => {
+                        cancelPenDrawing();
+                        setTrayState((prev) => ({ ...prev, activeTool: "select" }));
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+                        trayState.activeTool === "select"
+                          ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
+                          : "text-neutral-400 hover:text-neutral-200"
+                      }`}
+                      title="Select & Transform Tool (V)"
+                    >
+                      <MousePointer className="w-3 h-3" />
+                      <span>Select</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setTrayState((prev) => ({ ...prev, activeTool: "pen" }));
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+                        trayState.activeTool === "pen"
+                          ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
+                          : "text-neutral-400 hover:text-neutral-200"
+                      }`}
+                      title="Draw Custom Contour Pen Tool (P)"
+                    >
+                      <PenTool className="w-3 h-3" />
+                      <span>Pen Tool</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        cancelPenDrawing();
+                        setTrayState((prev) => ({ ...prev, activeTool: "pan" }));
+                      }}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+                        trayState.activeTool === "pan"
+                          ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
+                          : "text-neutral-400 hover:text-neutral-200"
+                      }`}
+                      title="Pan / Hand Tool (H or hold Spacebar)"
+                    >
+                      <Hand className="w-3 h-3" />
+                      <span>Pan</span>
+                    </button>
+                  </div>
+
+                  {/* Right: Zoom Controls & Manual Handles Toggle */}
                   <div className="flex items-center gap-2">
+                    {/* Zoom Widget */}
+                    <div className="flex items-center gap-1 bg-neutral-950 px-1 py-0.5 rounded-lg border border-neutral-800 text-[11px]">
+                      <button
+                        onClick={handleZoomOut}
+                        className="p-1 hover:text-neutral-100 text-neutral-400 cursor-pointer"
+                        title="Zoom Out (-)"
+                      >
+                        <ZoomOut className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={handleZoomReset}
+                        className="px-1.5 font-mono text-neutral-300 hover:text-amber-400 cursor-pointer"
+                        title="Click to reset zoom to 100%"
+                      >
+                        {Math.round(zoom * 100)}%
+                      </button>
+                      <button
+                        onClick={handleZoomIn}
+                        className="p-1 hover:text-neutral-100 text-neutral-400 cursor-pointer"
+                        title="Zoom In (+)"
+                      >
+                        <ZoomIn className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={handleZoomReset}
+                        className="p-1 hover:text-neutral-100 text-neutral-400 cursor-pointer border-l border-neutral-800 ml-0.5 pl-1.5"
+                        title="Reset to Fit Screen"
+                      >
+                        <Maximize className="w-3 h-3" />
+                      </button>
+                    </div>
+
                     {/* Manual Selection Mode Toggle */}
                     <button
                       onClick={() =>
@@ -679,27 +1118,25 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                           isManualEditMode: !prev.isManualEditMode,
                         }))
                       }
-                      className={`px-3 py-1 rounded-lg border transition-all cursor-pointer flex items-center gap-1.5 ${
+                      className={`px-2.5 py-1 rounded-lg border transition-all cursor-pointer flex items-center gap-1.5 ${
                         trayState.isManualEditMode
                           ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
                           : "bg-neutral-800 hover:bg-neutral-700 border-neutral-700 text-neutral-300"
                       }`}
                       title="Toggle interactive on-canvas handles to nudge or resize the selection box"
                     >
-                      <Sliders className="w-3.5 h-3.5" />
+                      <Sliders className="w-3 h-3" />
                       <span>
-                        {trayState.isManualEditMode
-                          ? `Manual Edit (Slot #${trayState.selectedSlot})`
-                          : "Manual Selection Help"}
+                        {trayState.isManualEditMode ? "Handles: ON" : "Handles"}
                       </span>
                     </button>
 
                     <button
                       onClick={() => fileInputRef.current?.click()}
-                      className="px-3 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg border border-neutral-700 transition-colors cursor-pointer flex items-center gap-1.5"
+                      className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg border border-neutral-700 transition-colors cursor-pointer flex items-center gap-1"
                     >
-                      <RotateCw className="w-3.5 h-3.5 text-neutral-400" />
-                      <span>Replace Photo</span>
+                      <RotateCw className="w-3 h-3 text-neutral-400" />
+                      <span>Replace</span>
                     </button>
                   </div>
                 </div>

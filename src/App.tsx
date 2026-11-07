@@ -44,6 +44,7 @@ export default function App() {
     hoveredSlot: null,
     isManualEditMode: false,
     originalSlots: {},
+    activeTool: "select",
   });
 
   // Check Python sidecar connection
