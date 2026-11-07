@@ -1,11 +1,13 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import {
   RotateCw,
   Wand2,
   ChevronDown,
   RotateCcw,
+  Loader2,
 } from "lucide-react";
 import { FingerName, NailShape, TrayState, DetectedSlot } from "../../types";
+import { callSidecar } from "../../services/sidecar";
 
 interface TrayControlsProps {
   trayState: TrayState;
@@ -26,6 +28,8 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   trayState,
   setTrayState,
 }) => {
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+
   const {
     selectedSlot,
     slotFinger,
@@ -47,6 +51,52 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
 
   const currentRotation = nailRotation[selectedSlot] || 0;
   const isInverted = slotInverted[selectedSlot] || false;
+  const activePreview = extractedPreviews[selectedSlot];
+
+  // Auto-fetch upright cutout preview whenever selected slot changes or photo is loaded
+  useEffect(() => {
+    if (!trayState.trayImageSrc || !activeSlotData) return;
+    if (extractedPreviews[selectedSlot]) return;
+
+    let isMounted = true;
+    setIsLoadingPreview(true);
+
+    callSidecar<{
+      status: string;
+      width: number;
+      height: number;
+      image_base64: string;
+    }>("extract_nail", {
+      image_base64: trayState.trayImageSrc,
+      contour: activeSlotData.contour,
+      deskew: true,
+      auto_orient_cuticle_down: true,
+    })
+      .then((ext) => {
+        if (isMounted && ext && ext.status === "ok" && ext.image_base64) {
+          const previewUrl = ext.image_base64.startsWith("data:")
+            ? ext.image_base64
+            : `data:image/png;base64,${ext.image_base64}`;
+          setTrayState((prev) => ({
+            ...prev,
+            extractedPreviews: {
+              ...prev.extractedPreviews,
+              [selectedSlot]: previewUrl,
+            },
+          }));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (isMounted) {
+          setIsLoadingPreview(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [trayState.trayImageSrc, selectedSlot, activeSlotData, extractedPreviews, setTrayState]);
 
   const handleSlotSelect = (slotId: number) => {
     setTrayState((prev) => ({ ...prev, selectedSlot: slotId }));
@@ -124,8 +174,6 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
       },
     }));
   };
-
-  const activePreview = extractedPreviews[selectedSlot];
 
   return (
     <div className="p-5 space-y-6 select-none">
@@ -224,8 +272,15 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                   }}
                 />
               ) : (
-                <div className="text-[9px] text-neutral-600 text-center px-1">
-                  Cutout preview
+                <div className="flex flex-col items-center justify-center gap-1 text-[9px] text-neutral-500 text-center px-1">
+                  {isLoadingPreview ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
+                      <span>Extracting...</span>
+                    </>
+                  ) : (
+                    <span>Cutout preview</span>
+                  )}
                 </div>
               )}
             </div>

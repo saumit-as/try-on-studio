@@ -57,6 +57,11 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         isSegmenting: true,
         segmentError: null,
         detectedSlots: [],
+        extractedPreviews: {},
+        shapeOverrides: {},
+        nailRotation: {},
+        slotInverted: {},
+        selectedSlot: 1,
       }));
 
       try {
@@ -87,7 +92,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
             slotFinger: defaultMapping,
           }));
 
-          // Fetch preview for slot 1
+          // Fetch preview for initial slot
           if (res.slots.length > 0) {
             fetchNailPreview(base64Data, res.slots[0]);
           }
@@ -105,6 +110,9 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       }
     };
     reader.readAsDataURL(file);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
   };
 
   const fetchNailPreview = async (imageSrc: string, slot: DetectedSlot) => {
