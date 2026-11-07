@@ -14,11 +14,16 @@ French smile lines, and sheer ombré gradients):
   Pass 6: Fingertip Cast Shadow, Sensor Micro-Grain & Sub-Pixel Anti-Aliased Composite
 """
 
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 import cv2
 import numpy as np
 import scipy.ndimage
-from warping import build_cuticle_pocket_mask
+from warping import (
+    build_cuticle_pocket_mask,
+    apply_cylindrical_c_curve,
+    build_3tier_control_grid,
+    warp_nail_tps,
+)
 
 
 def clean_tray_glare_preserving_texture(nail_rgba: np.ndarray) -> np.ndarray:
@@ -210,6 +215,7 @@ def composite_nail_pbr(
     warped_roi: np.ndarray,
     bbox: Tuple[int, int, int, int],
     target: Dict[str, Any],
+    lighting_options: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Executes the 6-pass True-Texture PBR studio relighting and compositing pipeline on a warped nail ROI.
@@ -221,13 +227,18 @@ def composite_nail_pbr(
       - 0.88 gentle contact AO tuck at the proximal cuticle base.
       - Sheer nail-bed translucency restricted to max 10%, only where v_map < 0.62 AND local texture
         variance std(L) in 9x9 is low (< 4.0), preventing washout of floral art, charms, or French tips.
-      - Removed the legacy is_light_pink diffuse override that caused color flattening.
-      - Adaptive clear-coat specular sheen: scales spec_alpha by 0.55 when interior luminance std is high
-        (e.g. 3D charms, metallic stripes, cat-eye shimmer) so reflections enhance rather than compete.
+      - Adaptive clear-coat specular sheen: scales spec_alpha by 0.55 when interior luminance std is high.
+      - Dynamic lighting_options support (glossIntensity, shadowDepth, lightAngle, preset).
     """
     rx, ry, rw, rh = bbox
     if rw <= 0 or rh <= 0:
         return
+
+    opt: Dict[str, Any] = lighting_options or {}
+    gloss_mult: float = float(opt.get("glossIntensity", 1.0))
+    shadow_mult: float = float(opt.get("shadowDepth", 1.0))
+    light_angle_deg: float = float(opt.get("lightAngle", 0.0))
+    preset: str = str(opt.get("preset", "studio"))
 
     warped_bgr: np.ndarray = warped_roi[:, :, :3].astype(np.float32)
     raw_alpha: np.ndarray = warped_roi[:, :, 3].astype(np.float32) / 255.0
@@ -251,7 +262,11 @@ def composite_nail_pbr(
     u_map, v_map, nx, ny, nz = compute_3d_nail_geometry(tucked_alpha, roll_offset=roll_offset)
 
     # Pass 3: Studio Diffuse Relighting & Sheer Subsurface Translucency
-    L_key: np.ndarray = np.array([0.64, -0.14, 0.755], dtype=np.float32)
+    # Rotate key light around Y axis by light_angle_deg
+    rad: float = float(np.radians(light_angle_deg))
+    lx: float = 0.64 * np.cos(rad) + 0.755 * np.sin(rad)
+    lz: float = -0.64 * np.sin(rad) + 0.755 * np.cos(rad)
+    L_key: np.ndarray = np.array([lx, -0.14, lz], dtype=np.float32)
     L_key /= np.linalg.norm(L_key)
     ndotl_key: np.ndarray = np.clip(nx * L_key[0] + ny * L_key[1] + nz * L_key[2], 0.0, 1.0)
 
@@ -265,7 +280,6 @@ def composite_nail_pbr(
     interior_lum_std: float = float(np.std(nail_lum[interior_bool])) if np.any(interior_bool) else 15.0
 
     # Sheer Translucency: Restricted strictly to the proximal nail bed zone (v_map < 0.62)
-    # AND low local texture variance (std(L) in 9x9 < 4.0) to protect artwork, charms & French tips.
     v_bed_zone: np.ndarray = np.clip((0.62 - v_map) / 0.15, 0.0, 1.0)
     low_texture_var: np.ndarray = np.clip((4.0 - local_std_L) / 1.5, 0.0, 1.0)
     sheer_weight: np.ndarray = 0.10 * v_bed_zone * low_texture_var
@@ -277,8 +291,6 @@ def composite_nail_pbr(
     )
 
     # 3D Cylindrical Diffuse Ratio: Constrained strictly to [0.84, 1.04]
-    # Center dome (|u| <= 0.55): 0.97 to 1.03, preserving 100% photographic texture/color
-    # Lateral sidewalls (|u| -> 1.0): smooth cosine roll-off down to 0.84 shaded / 0.90 lit sidewall
     center_diffuse: np.ndarray = 0.97 + 0.06 * ndotl_key
     u_abs: np.ndarray = np.abs(u_map)
     t_side: np.ndarray = np.clip((u_abs - 0.55) / 0.45, 0.0, 1.0)
@@ -303,21 +315,19 @@ def composite_nail_pbr(
     lit_bgr = lit_bgr + left_rim_mask[:, :, None] * 0.06 * env_color
 
     # Pass 4: High-Gloss Clear Gel Topcoat Specular Reflections
-    # In studio portraiture, key light highlight sits along the dorsal crest (u ~ 0.28 to 0.35)
-    spec_u_center: float = 0.30 - roll_offset * 0.40
+    spec_u_center: float = 0.30 - roll_offset * 0.40 + (light_angle_deg / 180.0) * 0.20
     u_delta: np.ndarray = u_map - spec_u_center
 
-    # Broad studio dome sheen (subtle ambient surface gloss)
+    # Broad studio dome sheen
     v_sheen_env: np.ndarray = np.sin(np.clip((v_map - 0.05) / 0.88, 0.0, 1.0) * np.pi)
     broad_sheen: np.ndarray = np.exp(-0.5 * (u_delta / 0.18) ** 2) * v_sheen_env
 
-    # Crisp, glassy vertical softbox window reflection ribbon matching real salon gel topcoat
+    # Crisp vertical softbox window reflection ribbon
     v_rib_in: np.ndarray = np.clip((v_map - 0.10) / 0.15, 0.0, 1.0)
     v_rib_out: np.ndarray = np.clip((0.90 - v_map) / 0.12, 0.0, 1.0)
     apex_hotspot: np.ndarray = 0.80 + 0.20 * np.exp(-0.5 * ((v_map - 0.48) / 0.22) ** 2)
     v_rib_env: np.ndarray = (v_rib_in ** 1.2) * (v_rib_out ** 1.3) * apex_hotspot
 
-    # Crisp, sharp ribbon width (half-width ~ 0.026) for mirror-like polish reflection
     rib_half_w: np.ndarray = 0.026 * (0.60 + 0.40 * np.sin(np.clip((v_map - 0.08) / 0.82, 0.0, 1.0) * np.pi))
     gloss_ribbon: np.ndarray = np.exp(-0.5 * (np.abs(u_delta) / np.maximum(0.008, rib_half_w)) ** 2.2) * v_rib_env
 
@@ -326,15 +336,18 @@ def composite_nail_pbr(
     fill_v_env: np.ndarray = np.maximum(0.0, np.sin(np.clip((v_map - 0.10) / 0.55, 0.0, 1.0) * np.pi)) ** 1.2
     fill_reflection: np.ndarray = np.exp(-0.5 * (fill_u_delta / 0.055) ** 2.0) * fill_v_env
 
-    spec_total: np.ndarray = (
-        0.08 * broad_sheen
-        + 1.05 * gloss_ribbon
-        + 0.09 * fill_reflection
-    )
+    # Preset adaptations
+    if preset == "ring":
+        spec_total: np.ndarray = (0.25 * broad_sheen + 0.65 * gloss_ribbon + 0.25 * fill_reflection) * gloss_mult
+    elif preset == "flash":
+        spec_total = (0.05 * broad_sheen + 1.45 * gloss_ribbon + 0.05 * fill_reflection) * gloss_mult
+    elif preset == "natural":
+        spec_total = (0.45 * broad_sheen + 0.40 * gloss_ribbon + 0.15 * fill_reflection) * gloss_mult
+    else:
+        spec_total = (0.08 * broad_sheen + 1.05 * gloss_ribbon + 0.09 * fill_reflection) * gloss_mult
+
     spec_total = cv2.GaussianBlur(spec_total, (3, 3), 0.5)
 
-    # Adaptive Clear-Coat Specular: Scale down spec_alpha by 0.55 when interior luminance
-    # std-dev is high (cat-eye shimmer, 3D charms, metallic nail art)
     high_contrast_weight: float = float(np.clip((interior_lum_std - 18.0) / 10.0, 0.0, 1.0))
     spec_scale: float = 1.0 - 0.45 * high_contrast_weight
 
@@ -355,14 +368,14 @@ def composite_nail_pbr(
     sensor_grain: np.ndarray = rng.normal(0.0, 1.15, size=(rh, rw, 1)).astype(np.float32)
     lit_bgr = np.clip(lit_bgr + sensor_grain, 0.0, 255.0)
 
-    # Under-Tip Fingertip Cast Shadow (directional light from upper-left casts shadow downward-right)
-    M_sh: np.ndarray = np.float32([[1.0, 0.0, 1.6], [0.0, 1.0, 4.2]])
+    # Under-Tip Fingertip Cast Shadow
+    M_sh: np.ndarray = np.float32([[1.0, 0.0, 1.6 + light_angle_deg * 0.05], [0.0, 1.0, 4.2]])
     shifted_alpha: np.ndarray = cv2.warpAffine(tucked_alpha, M_sh, (rw, rh), flags=cv2.INTER_LINEAR)
     shadow_blur: np.ndarray = cv2.GaussianBlur(shifted_alpha, (11, 11), 3.2)
 
     patch_hsv: np.ndarray = cv2.cvtColor(hand_patch.astype(np.uint8), cv2.COLOR_BGR2HSV)
     skin_weight: np.ndarray = np.clip((patch_hsv[:, :, 1].astype(np.float32) - 18.0) / 25.0, 0.0, 1.0)
-    under_shadow_mult: np.ndarray = 1.0 - 0.28 * shadow_blur * (1.0 - tucked_alpha) * skin_weight
+    under_shadow_mult: np.ndarray = 1.0 - (0.28 * shadow_mult) * shadow_blur * (1.0 - tucked_alpha) * skin_weight
     hand_curr: np.ndarray = composite_hand[ry:ry + rh, rx:rx + rw]
     hand_with_shadow: np.ndarray = hand_curr * under_shadow_mult[:, :, None]
 
@@ -370,3 +383,140 @@ def composite_nail_pbr(
     composite_hand[ry:ry + rh, rx:rx + rw] = (
         lit_bgr * alpha_smooth + hand_with_shadow * (1.0 - alpha_smooth)
     )
+
+
+def render_full_hand_composite(
+    hand_bgr: np.ndarray,
+    landmarks: Dict[str, Any],
+    mapped_nails_rgba: Dict[str, np.ndarray],
+    lighting_options: Optional[Dict[str, Any]] = None,
+    downscale: float = 1.0,
+) -> np.ndarray:
+    """
+    Renders the complete 5-finger composite with physical PBR lighting and TPS warping.
+    Supports downscaled fast preview (<100ms) for responsive slider adjustments.
+    """
+    h_hand, w_hand = hand_bgr.shape[:2]
+    opt = lighting_options or {}
+    overall_len_scale = float(opt.get("nailLengthScale", 1.0))
+    c_curve_user = float(opt.get("cCurveIntensity", 1.0))
+
+    if downscale < 1.0:
+        h_work = max(64, int(round(h_hand * downscale)))
+        w_work = max(64, int(round(w_hand * downscale)))
+        hand_work = cv2.resize(hand_bgr, (w_work, h_work), interpolation=cv2.INTER_AREA)
+    else:
+        h_work, w_work = h_hand, w_hand
+        hand_work = hand_bgr.copy()
+
+    composite_canvas = hand_work.copy().astype(np.float32)
+
+    cleaned_nails: Dict[str, np.ndarray] = {}
+    for fname, rgba in mapped_nails_rgba.items():
+        if rgba is not None and rgba.size > 0:
+            cleaned = clean_tray_glare_preserving_texture(rgba)
+            if downscale < 1.0:
+                cleaned = cv2.resize(cleaned, (0, 0), fx=downscale, fy=downscale, interpolation=cv2.INTER_AREA)
+            cleaned_nails[fname] = cleaned
+
+    if not cleaned_nails:
+        return hand_work
+
+    finger_keys = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+    hand_bed_widths = []
+    tray_widths = []
+    for fname in finger_keys:
+        if fname in landmarks and fname in cleaned_nails:
+            lm = landmarks[fname]
+            cw = float(np.linalg.norm(np.array(lm["c_r"]) - np.array(lm["c_l"]))) * downscale
+            dw = float(np.linalg.norm(np.array(lm["d_r"]) - np.array(lm["d_l"]))) * downscale
+            hand_bed_widths.append(max(cw, dw))
+            nd = cleaned_nails[fname]
+            xs = np.where(nd[:, :, 3] > 25)[1]
+            tray_widths.append(float(np.max(xs) - np.min(xs) + 1) if len(xs) > 0 else float(nd.shape[1]))
+
+    tray_scale = 1.0
+    if len(hand_bed_widths) > 0 and len(tray_widths) > 0 and sum(tray_widths) > 0:
+        tray_scale = (sum(hand_bed_widths) / max(1.0, sum(tray_widths))) * 1.05
+
+    for fname in finger_keys:
+        if fname not in landmarks or fname not in cleaned_nails:
+            continue
+        lm = landmarks[fname]
+        clean_rgba = cleaned_nails[fname]
+
+        # Extract per-finger adjustments (from lighting_options or landmarks)
+        finger_adj = opt.get("finger_adjustments", {}).get(fname, {})
+
+        c_curve_val = float(finger_adj.get("cCurve", finger_adj.get("c_curve", lm.get("c_curve", 0.28))))
+        c_curve = c_curve_val * c_curve_user
+        roll = float(finger_adj.get("roll_offset", lm.get("roll_offset", 0.0)))
+
+        curved = apply_cylindrical_c_curve(clean_rgba, c_curve_intensity=c_curve, roll_offset=roll)
+        src_h, src_w = curved.shape[:2]
+
+        c_l = [lm["c_l"][0] * downscale, lm["c_l"][1] * downscale]
+        c_c = [lm["c_c"][0] * downscale, lm["c_c"][1] * downscale]
+        c_r = [lm["c_r"][0] * downscale, lm["c_r"][1] * downscale]
+        d_l = [lm["d_l"][0] * downscale, lm["d_l"][1] * downscale]
+        d_r = [lm["d_r"][0] * downscale, lm["d_r"][1] * downscale]
+
+        len_scale = float(finger_adj.get("lengthScale", finger_adj.get("length_scale", lm.get("length_scale", 1.0)))) * overall_len_scale
+        width_scale = float(finger_adj.get("widthScale", finger_adj.get("width_scale", lm.get("width_scale", 1.0))))
+        axial_shift = float(finger_adj.get("axialShift", finger_adj.get("axial_shift", lm.get("axial_shift", 0.0)))) * downscale
+        angle_offset = float(finger_adj.get("angleOffset", finger_adj.get("angle_offset", lm.get("angle_offset", 0.0))))
+        tip_taper = float(finger_adj.get("tipTaper", finger_adj.get("tip_taper", lm.get("tip_taper", 1.0))))
+
+        src_pts, dst_pts = build_3tier_control_grid(
+            src_w=src_w,
+            src_h=src_h,
+            cuticle_left=c_l,
+            cuticle_center=c_c,
+            cuticle_right=c_r,
+            distal_left=d_l,
+            distal_right=d_r,
+            length_scale=len_scale,
+            tip_taper=tip_taper,
+            roll_offset=roll,
+            tray_to_hand_scale=tray_scale,
+            width_scale=width_scale,
+            axial_shift=axial_shift,
+            angle_offset=angle_offset,
+        )
+
+        warped_roi, bbox = warp_nail_tps(curved, src_pts, dst_pts, output_shape=(h_work, w_work))
+
+        # Update cuticle coordinates for anatomical tuck mask alignment
+        tuck_c_c = c_c
+        tuck_c_l = c_l
+        tuck_c_r = c_r
+        if abs(axial_shift) > 0.01:
+            distal_mid = (np.array(d_l) + np.array(d_r)) * 0.5
+            axis_vec = distal_mid - np.array(c_c)
+            b_len = np.linalg.norm(axis_vec)
+            if b_len > 0:
+                ax_unit = axis_vec / b_len
+                shift_vec = ax_unit * axial_shift
+                tuck_c_c = (np.array(c_c) + shift_vec).tolist()
+                tuck_c_l = (np.array(c_l) + shift_vec).tolist()
+                tuck_c_r = (np.array(c_r) + shift_vec).tolist()
+
+        target_dict = {
+            "name": fname,
+            "c_l": tuck_c_l,
+            "c_c": tuck_c_c,
+            "c_r": tuck_c_r,
+            "d_l": d_l,
+            "d_r": d_r,
+            "c_curve": c_curve,
+            "roll_offset": roll,
+            "length_scale": len_scale,
+            "tip_taper": tip_taper,
+            "width_scale": width_scale,
+            "axial_shift": axial_shift,
+            "angle_offset": angle_offset,
+        }
+
+        composite_nail_pbr(composite_canvas, hand_work, warped_roi, bbox, target_dict, lighting_options=opt)
+
+    return np.clip(composite_canvas, 0, 255).astype(np.uint8)

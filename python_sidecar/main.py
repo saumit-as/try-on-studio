@@ -4,6 +4,7 @@ Press-On Nail Mockup Generator - Python Sidecar
 Persistent JSON-RPC stdio daemon handling:
   - Nail contour segmentation & PCA deskewing
   - Thin-Plate Spline (TPS) warping & C-curve cylindrical distortion
+  - Hand template rigging & procedural map generation (cuticle fold, AO shadow, specular gloss)
   - Multi-pass PBR lighting compositing
   - High-DPI and multi-layer PSD exports
 """
@@ -21,6 +22,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+REPO_ROOT = os.path.abspath(os.path.join(current_dir, ".."))
+
 from segmentation import (
     segment_packaging_tray,
     extract_nail_rgba,
@@ -34,6 +37,16 @@ from warping import (
     warp_nail_tps,
     build_cuticle_pocket_mask,
 )
+from template_generator import (
+    DEFAULT_STUDIO_LANDMARKS,
+    generate_all_rig_maps,
+    save_nailtemplate_bundle,
+    load_nailtemplate_bundle,
+    init_default_studio_template,
+    auto_detect_hand_landmarks,
+    refit_finger_landmarks,
+)
+from compositor import render_full_hand_composite
 
 
 def handle_ping(params):
@@ -42,6 +55,20 @@ def handle_ping(params):
 
 def handle_echo(params):
     return params
+
+
+def _encode_png_base64(img: np.ndarray) -> str:
+    success, buffer = cv2.imencode(".png", img)
+    if not success:
+        raise ValueError("Failed to encode image to PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer).decode("utf-8")
+
+
+def _encode_jpg_base64(img: np.ndarray, quality: int = 92) -> str:
+    success, buffer = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not success:
+        raise ValueError("Failed to encode image to JPG")
+    return "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
 
 
 def _load_image(params):
@@ -211,6 +238,235 @@ def handle_warp_nail(params):
     }
 
 
+def handle_get_default_hand_template(params):
+    """
+    Returns the bundled Default Studio Hand template metadata, landmarks,
+    and base64 pre-rendered maps and image.
+    """
+    template_dir = os.path.join(REPO_ROOT, "templates", "default_studio_hand")
+    if not os.path.exists(template_dir) or not os.path.exists(os.path.join(template_dir, "template.json")):
+        init_default_studio_template(REPO_ROOT)
+
+    data = load_nailtemplate_bundle(template_dir)
+    include_images = params.get("include_images", True)
+
+    res = {
+        "status": "ok",
+        "metadata": data["metadata"],
+        "landmarks": data["metadata"].get("landmarks", DEFAULT_STUDIO_LANDMARKS),
+        "image_size": data["metadata"].get("image_size", [1536, 2752]),
+    }
+
+    if include_images:
+        if data["hand_bgr"] is not None:
+            res["hand_image_base64"] = _encode_jpg_base64(data["hand_bgr"], quality=90)
+        if data["cuticle_mask"] is not None:
+            res["cuticle_mask_base64"] = _encode_png_base64(data["cuticle_mask"])
+        if data["ao_map"] is not None:
+            res["ao_map_base64"] = _encode_png_base64(data["ao_map"])
+        if data["specular_map"] is not None:
+            res["specular_map_base64"] = _encode_png_base64(data["specular_map"])
+
+    return res
+
+
+def handle_generate_hand_maps(params):
+    """
+    Generates procedural cuticle occlusion, contact AO, and specular reflection maps
+    given an arbitrary bare hand image and 5-point finger landmarks.
+    """
+    img = _load_image(params)
+    landmarks = params.get("landmarks", DEFAULT_STUDIO_LANDMARKS)
+    maps = generate_all_rig_maps(img, landmarks)
+
+    return {
+        "status": "ok",
+        "cuticle_mask_base64": _encode_png_base64(maps["cuticle_mask"]),
+        "ao_map_base64": _encode_png_base64(maps["ao_map"]),
+        "specular_map_base64": _encode_png_base64(maps["specular_map"]),
+    }
+
+
+def handle_save_hand_template(params):
+    """
+    Saves a .nailtemplate file or bundle.
+    """
+    target_path = params.get("target_path")
+    template_name = params.get("name", "Custom Hand Template")
+    landmarks = params.get("landmarks", {})
+    img = _load_image(params)
+
+    if not target_path:
+        raise ValueError("Missing 'target_path' parameter")
+
+    if target_path.endswith(".nailtemplate") or target_path.endswith(".json"):
+        maps = generate_all_rig_maps(img, landmarks)
+        h, w = img.shape[:2]
+        bundle = {
+            "format": "nailtemplate",
+            "version": "1.0.0",
+            "name": template_name,
+            "image_size": [int(w), int(h)],
+            "landmarks": landmarks,
+            "hand_image_base64": _encode_jpg_base64(img),
+            "cuticle_mask_base64": _encode_png_base64(maps["cuticle_mask"]),
+            "ao_map_base64": _encode_png_base64(maps["ao_map"]),
+            "specular_map_base64": _encode_png_base64(maps["specular_map"]),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(bundle, f)
+        return {"status": "ok", "saved_path": target_path}
+    else:
+        meta_path = save_nailtemplate_bundle(target_path, template_name, img, landmarks)
+        return {"status": "ok", "saved_path": meta_path}
+
+
+def handle_load_hand_template(params):
+    """
+    Loads a .nailtemplate file or directory bundle.
+    """
+    source_path = params.get("source_path")
+    raw_content = params.get("content_json")
+
+    if raw_content:
+        data = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        return {"status": "ok", "template": data}
+    elif source_path:
+        if os.path.isfile(source_path):
+            with open(source_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"status": "ok", "template": data}
+        elif os.path.isdir(source_path):
+            data = load_nailtemplate_bundle(source_path)
+            res = {
+                "format": "nailtemplate",
+                "version": "1.0.0",
+                "name": data["metadata"].get("name", "Loaded Template"),
+                "image_size": data["metadata"].get("image_size", [1536, 2752]),
+                "landmarks": data["metadata"].get("landmarks", {}),
+            }
+            if data["hand_bgr"] is not None:
+                res["hand_image_base64"] = _encode_jpg_base64(data["hand_bgr"])
+            if data["cuticle_mask"] is not None:
+                res["cuticle_mask_base64"] = _encode_png_base64(data["cuticle_mask"])
+            if data["ao_map"] is not None:
+                res["ao_map_base64"] = _encode_png_base64(data["ao_map"])
+            if data["specular_map"] is not None:
+                res["specular_map_base64"] = _encode_png_base64(data["specular_map"])
+            return {"status": "ok", "template": res}
+        else:
+            raise FileNotFoundError(f"Source path not found: {source_path}")
+    else:
+        raise ValueError("Missing 'source_path' or 'content_json'")
+
+
+def handle_auto_detect_hand(params):
+    """
+    Analyzes an arbitrary user hand photo using Computer Vision,
+    automatically detects fingertips, palm center, handedness, and the 5-point nail landmarks.
+    """
+    img = _load_image(params)
+    handedness_hint = params.get("handedness", "auto")
+    res = auto_detect_hand_landmarks(img, handedness_hint=handedness_hint)
+    return {
+        "status": "ok",
+        "landmarks": res["landmarks"],
+        "handedness": res["handedness"],
+        "palm_center": res["palm_center"],
+        "palm_radius": res["palm_radius"],
+    }
+
+
+def handle_refit_finger(params):
+    """
+    Computes accurate 5-point nail landmarks within a user-drawn or detected
+    bounding box [x, y, w, h] over any specific fingertip.
+    """
+    img = _load_image(params)
+    finger_name = params.get("finger_name") or params.get("finger")
+    if not finger_name:
+        raise ValueError("Missing 'finger_name' parameter")
+    bbox = params.get("bbox")
+    if not bbox or len(bbox) != 4:
+        raise ValueError("Missing or invalid 'bbox' parameter [x, y, w, h]")
+    handedness = params.get("handedness", "left")
+
+    res = refit_finger_landmarks(img, finger_name, bbox, handedness=handedness)
+    return {
+        "status": "ok",
+        "finger_name": res["finger_name"],
+        "landmarks": res["landmarks"],
+    }
+
+
+def _load_rgba_image(base64_str: str) -> np.ndarray:
+    if "," in base64_str:
+        base64_str = base64_str.split(",", 1)[1]
+    img_bytes = base64.b64decode(base64_str)
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("Failed to decode base64 RGBA image")
+    return img
+
+
+def handle_render_composite(params):
+    import time
+    t0 = time.time()
+
+    # 1. Load Hand Base Image
+    hand_src = params.get("hand_image_base64") or params.get("image_base64")
+    if hand_src and isinstance(hand_src, str) and hand_src.startswith("data:"):
+        hand_bgr = _load_image({"image_base64": hand_src})
+    elif "image_path" in params and os.path.exists(params["image_path"]):
+        hand_bgr = cv2.imread(params["image_path"])
+    else:
+        default_path = os.path.join(REPO_ROOT, "templates", "default_studio_hand", "hand.jpg")
+        if not os.path.exists(default_path):
+            default_path = os.path.join(REPO_ROOT, "test_assets", "hand-template.jpg")
+        hand_bgr = cv2.imread(default_path)
+        if hand_bgr is None:
+            raise FileNotFoundError("Master studio hand template not found")
+
+    # 2. Landmarks
+    landmarks = params.get("landmarks") or DEFAULT_STUDIO_LANDMARKS
+
+    # 3. Mapped Nails (dict mapping finger name to RGBA base64)
+    raw_mapped = params.get("mapped_nails", {})
+    mapped_nails_rgba = {}
+    for fname, b64 in raw_mapped.items():
+        if b64 and isinstance(b64, str):
+            try:
+                mapped_nails_rgba[fname] = _load_rgba_image(b64)
+            except Exception as e:
+                print(f"Warning: Failed to decode nail for {fname}: {e}")
+
+    # 4. Lighting Options & Downscale
+    lighting_options = params.get("lighting_options", {})
+    downscale = float(params.get("downscale", 1.0))
+    downscale = max(0.2, min(1.0, downscale))
+
+    # 5. Render Full Hand Composite
+    composite_bgr = render_full_hand_composite(
+        hand_bgr=hand_bgr,
+        landmarks=landmarks,
+        mapped_nails_rgba=mapped_nails_rgba,
+        lighting_options=lighting_options,
+        downscale=downscale,
+    )
+
+    t_render = int((time.time() - t0) * 1000)
+
+    quality = 90 if downscale < 1.0 else 95
+    return {
+        "status": "ok",
+        "composite_base64": _encode_jpg_base64(composite_bgr, quality=quality),
+        "image_size": [int(composite_bgr.shape[1]), int(composite_bgr.shape[0])],
+        "render_time_ms": t_render,
+    }
+
+
 HANDLERS = {
     "ping": handle_ping,
     "echo": handle_echo,
@@ -218,6 +474,13 @@ HANDLERS = {
     "extract_nail": handle_extract_nail,
     "refit_slot_contour": handle_refit_slot_contour,
     "warp_nail": handle_warp_nail,
+    "get_default_hand_template": handle_get_default_hand_template,
+    "generate_hand_maps": handle_generate_hand_maps,
+    "save_hand_template": handle_save_hand_template,
+    "load_hand_template": handle_load_hand_template,
+    "auto_detect_hand": handle_auto_detect_hand,
+    "refit_finger": handle_refit_finger,
+    "render_composite": handle_render_composite,
 }
 
 

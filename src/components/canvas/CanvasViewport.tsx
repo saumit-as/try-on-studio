@@ -9,7 +9,6 @@ import React, {
   MouseEvent as ReactMouseEvent,
 } from "react";
 import {
-  Sparkles,
   Download,
   Upload,
   Loader2,
@@ -27,13 +26,19 @@ import {
   X,
   Wand2,
 } from "lucide-react";
-import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor } from "../../types";
+import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor, HandState, LightingState } from "../../types";
 import { callSidecar } from "../../services/sidecar";
+import { HandRigCanvas } from "./HandRigCanvas";
+import { CompositeCanvas } from "./CompositeCanvas";
 
 interface CanvasViewportProps {
   activeTab: ActiveTab;
   trayState: TrayState;
   setTrayState: React.Dispatch<React.SetStateAction<TrayState>>;
+  handState: HandState;
+  setHandState: React.Dispatch<React.SetStateAction<HandState>>;
+  lightingState: LightingState;
+  setLightingState: React.Dispatch<React.SetStateAction<LightingState>>;
 }
 
 const SLOT_PALETTE = [
@@ -169,6 +174,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   activeTab,
   trayState,
   setTrayState,
+  handState,
+  setHandState,
+  lightingState,
+  setLightingState,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -2038,33 +2047,26 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           </div>
         )}
 
-        {/* Hand Rigging Placeholder */}
+        {/* Hand Rigging Canvas */}
         {activeTab === "hand" && (
-          <div className="flex flex-col items-center justify-center text-center max-w-md p-8 border border-neutral-800 rounded-2xl bg-neutral-900/40">
-            <div className="w-16 h-16 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center mb-4 text-amber-400 shadow-md">
-              <Hand className="w-8 h-8" />
-            </div>
-            <h3 className="text-base font-semibold text-neutral-200 mb-1">
-              Phase 3: Hand Rigging Canvas
-            </h3>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Place 5 anchor points on each finger to define cuticle curves, sidewalls, and fingertip length vectors. Ships with built-in Default Studio Hand template.
-            </p>
+          <div className="w-full h-full relative">
+            <HandRigCanvas
+              handState={handState}
+              setHandState={setHandState}
+            />
           </div>
         )}
 
-        {/* Composite Mockup Placeholder */}
+        {/* Phase 4: Live PBR Composite Viewport */}
         {activeTab === "composite" && (
-          <div className="flex flex-col items-center justify-center text-center max-w-md p-8 border border-neutral-800 rounded-2xl bg-neutral-900/40">
-            <div className="w-16 h-16 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center mb-4 text-amber-400 shadow-md">
-              <Sparkles className="w-8 h-8" />
-            </div>
-            <h3 className="text-base font-semibold text-neutral-200 mb-1">
-              Phase 4: Real-Time PBR Compositor
-            </h3>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Photorealistic 6-pass physical blending: Glare Healing, Studio Softbox Relighting, Specular Ribbons, Anatomical Pocket Tuck, and Contact Ambient Occlusion.
-            </p>
+          <div className="w-full h-full relative">
+            <CompositeCanvas
+              trayState={trayState}
+              setTrayState={setTrayState}
+              handState={handState}
+              lightingState={lightingState}
+              setLightingState={setLightingState}
+            />
           </div>
         )}
 

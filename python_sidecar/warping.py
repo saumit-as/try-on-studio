@@ -104,6 +104,9 @@ def build_3tier_control_grid(
     tip_taper: float = 1.0,
     roll_offset: float = 0.0,
     tray_to_hand_scale: Optional[float] = None,
+    width_scale: float = 1.0,
+    axial_shift: float = 0.0,
+    angle_offset: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Constructs an Orthogonal, Silhouette-Preserving 3-tier (9-point) control grid
@@ -116,6 +119,11 @@ def build_3tier_control_grid(
          - Keeps the upper nail body rigid so the true ovoid/almond equator placement and
            smooth tip taper from the extracted nail are never inflated into a capsule.
       3. Preserves Each Nail's True Relative Length from the Tray Image (`tray_to_hand_scale`).
+      4. Per-Finger Custom Fitting:
+         - `length_scale`: Scales longitudinal tip extension length.
+         - `width_scale`: Scales transverse nail width / bed coverage.
+         - `axial_shift`: Longitudinal nudge along finger axis (deeper cuticle tuck or tip shift).
+         - `angle_offset`: Rotational angle alignment around cuticle center.
 
     Returns:
       (src_points [9, 2], dst_points [9, 2])
@@ -158,25 +166,43 @@ def build_3tier_control_grid(
     if np.dot(perp_unit, d_r - d_l) < 0:
         perp_unit = -perp_unit
 
+    # Apply rotational angle offset (degrees) around c_c if non-zero
+    if abs(angle_offset) > 0.01:
+        rad = np.deg2rad(float(angle_offset))
+        cos_t = np.cos(rad)
+        sin_t = np.sin(rad)
+        rot_axis = cos_t * axis_unit + sin_t * perp_unit
+        axis_unit = rot_axis / max(1e-6, np.linalg.norm(rot_axis))
+        perp_unit = np.array([-axis_unit[1], axis_unit[0]], dtype=np.float64)
+        if np.dot(perp_unit, d_r - d_l) < 0:
+            perp_unit = -perp_unit
+
+    # Apply longitudinal axial shift along axis_unit
+    if abs(axial_shift) > 0.01:
+        shift_vec = axis_unit * float(axial_shift)
+        c_c = c_c + shift_vec
+        c_l = c_l + shift_vec
+        c_r = c_r + shift_vec
+
     distal_width = float(np.linalg.norm(d_r - d_l))
     cuticle_width = float(np.linalg.norm(c_r - c_l))
     bed_width = max(distal_width, cuticle_width)
 
-    # Nail-bed half-width (`0.545 * bed_width`) covers the natural nail bed while preserving
-    # a sleek ~1:2.0 ovoid/almond aspect ratio and leaving natural finger skin on both sides
-    frame_half_w = bed_width * 0.545
+    # Nail-bed half-width adjusted by width_scale
+    w_mult = max(0.4, min(2.5, float(width_scale)))
+    frame_half_w = bed_width * 0.545 * w_mult
 
     # Preserve each nail's true length from the tray image
+    user_mult = max(0.2, min(3.0, float(length_scale))) if length_scale is not None else 1.0
     if tray_to_hand_scale is not None and tray_to_hand_scale > 0:
-        user_mult = length_scale if (length_scale is not None and 0.5 <= length_scale <= 2.0) else 1.0
         extension_dist = float(src_h) * tray_to_hand_scale * user_mult
     else:
         nail_aspect = float(src_h) / max(1.0, float(src_w))
         auto_total_len = (2.0 * frame_half_w) * nail_aspect
         if length_scale is not None and length_scale > 1.25:
-            extension_dist = max(bed_length * length_scale, auto_total_len)
+            extension_dist = max(bed_length * user_mult, auto_total_len)
         else:
-            extension_dist = max(bed_length * 1.34, auto_total_len)
+            extension_dist = max(bed_length * 1.34 * user_mult, auto_total_len)
 
     if abs(roll_offset) > 0.05:
         # 3/4 lateral profile thumb adjustment

@@ -3,7 +3,14 @@ import { Header } from "./components/layout/Header";
 import { CanvasViewport } from "./components/canvas/CanvasViewport";
 import { InspectorPanel } from "./components/inspector/InspectorPanel";
 import { pingSidecar } from "./services/sidecar";
-import { ActiveTab, SidecarStatus, LightingState, TrayState } from "./types";
+import {
+  ActiveTab,
+  SidecarStatus,
+  LightingState,
+  TrayState,
+  HandState,
+} from "./types";
+import { INITIAL_DEFAULT_HAND_TEMPLATE, DEFAULT_FINGER_ADJUSTMENTS } from "./constants/handDefaults";
 import "./App.css";
 
 export default function App() {
@@ -18,8 +25,10 @@ export default function App() {
     shadowDepth: 60,
     lightAngle: 45,
     cCurveIntensity: 65,
-    nailLengthScale: 1.15,
+    nailLengthScale: 1.05,
     showAdvanced: false,
+    selectedFinger: "All",
+    fingerAdjustments: JSON.parse(JSON.stringify(DEFAULT_FINGER_ADJUSTMENTS)),
   });
 
   // Tray State
@@ -46,6 +55,22 @@ export default function App() {
     originalSlots: {},
     activeTool: "select",
     slotPenAnchors: {},
+  });
+
+  // Phase 3: Hand Rigging State
+  const [handState, setHandState] = useState<HandState>({
+    currentTemplate: INITIAL_DEFAULT_HAND_TEMPLATE,
+    activeFinger: "All",
+    selectedLandmark: { finger: "Index", key: "c_c" },
+    isGeneratingMaps: false,
+    generateError: null,
+    overlayToggles: {
+      showLandmarks: true,
+      showGeometry: true,
+      showCuticleMask: false,
+      showAoMap: false,
+      showSpecular: false,
+    },
   });
 
   // Check Python sidecar connection
@@ -84,6 +109,10 @@ export default function App() {
           activeTab={activeTab}
           trayState={trayState}
           setTrayState={setTrayState}
+          handState={handState}
+          setHandState={setHandState}
+          lightingState={lightingState}
+          setLightingState={setLightingState}
         />
 
         {/* Right Parameter & Tooling Inspector */}
@@ -93,6 +122,8 @@ export default function App() {
           setLightingState={setLightingState}
           trayState={trayState}
           setTrayState={setTrayState}
+          handState={handState}
+          setHandState={setHandState}
         />
       </div>
     </div>
