@@ -62,10 +62,12 @@ try-on-studio/
 | **Cross-Platform Sidecar Discovery** | ✅ Complete | Multi-directory search (`resource_dir`, `current_exe().parent()`) |
 | **Frontend Deconstruction** | ✅ Complete | Modular architecture in `src/components/`, builds cleanly with `pnpm run build` |
 | **Stdio JSON-RPC IPC** | ✅ Complete | Tested via `pingSidecar()` $\rightarrow$ `pong` |
-| **Phase 1: Python CV & Warping Core** | 🟡 **Next Up** | `python_sidecar/segmentation.py` & `warping.py` |
-| **Phase 2: Tray Extractor UI** | ⏳ Planned | SVG contour overlays & slot-to-finger mapping |
-| **Phase 3: Hand Rigging & Master Hand** | ⏳ Planned | 5-point landmark placement & bundled studio hand |
-| **Phase 4: Real-Time PBR Compositor** | ⏳ Planned | 6-pass compositing & anatomical length presets |
+| **Phase 1: Python CV & Warping Core** | ✅ Complete | G2 super-ellipse, PCA deskew, 3-tier TPS, C-curve, Cuticle tuck |
+| **Realism Scoring & Quality Benchmark** | ✅ Complete | `score_realism_agent.py` & `test_all_nails.py` (83.2+ score) |
+| **Phase 4 Backend: 6-Pass PBR Compositor** | ✅ Complete | Glare healing, studio diffuse relighting, gel topcoat ribbon, contact drop shadows |
+| **Phase 2: Tray Extractor UI** | 🟡 **Next Up** | Interactive SVG contour overlays & slot-to-finger mapping in React |
+| **Phase 3: Hand Rigging Canvas** | ⏳ Planned | 5-point landmark placement on custom hands |
+| **Phase 4 Frontend: Compositor UI** | ⏳ Planned | Dual-tier lighting sliders and live preview |
 | **Phase 5: Production Export** | ⏳ Planned | 300 DPI PNG & layered PSD export |
 
 ---
