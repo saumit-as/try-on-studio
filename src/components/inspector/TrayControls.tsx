@@ -12,6 +12,10 @@ import {
   ArrowRight,
   Sliders,
   PenTool,
+  Maximize2,
+  X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { FingerName, NailShape, TrayState, DetectedSlot } from "../../types";
 import { callSidecar } from "../../services/sidecar";
@@ -38,6 +42,8 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isRefitting, setIsRefitting] = useState(false);
   const [nudgeStep, setNudgeStep] = useState<number>(5);
+  const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
+  const [modalZoom, setModalZoom] = useState<number>(1);
 
   const {
     selectedSlot,
@@ -379,18 +385,36 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
 
           {/* Upright Deskewed Cutout Thumbnail */}
           <div className="flex items-center gap-3 pt-1">
-            <div className="w-16 h-20 rounded-lg bg-neutral-950 border border-neutral-800 flex items-center justify-center overflow-hidden relative shrink-0">
+            <div
+              onClick={() => {
+                if (activePreview) {
+                  setIsPreviewModalOpen(true);
+                  setModalZoom(1);
+                }
+              }}
+              className={`w-16 h-20 rounded-lg bg-neutral-950 border border-neutral-800 flex items-center justify-center overflow-hidden relative shrink-0 transition-all ${
+                activePreview
+                  ? "cursor-pointer hover:border-amber-500/80 hover:shadow-lg hover:shadow-amber-500/10 group"
+                  : ""
+              }`}
+              title={activePreview ? "Click to inspect enlarged cutout & trim edges" : "Cutout preview"}
+            >
               {activePreview ? (
-                <img
-                  src={activePreview}
-                  alt={`Nail #${selectedSlot}`}
-                  className="max-w-full max-h-full object-contain"
-                  style={{
-                    transform: `rotate(${currentRotation}deg) ${
-                      isInverted ? "rotate(180deg)" : ""
-                    }`,
-                  }}
-                />
+                <>
+                  <img
+                    src={activePreview}
+                    alt={`Nail #${selectedSlot}`}
+                    className="max-w-full max-h-full object-contain group-hover:scale-105 transition-transform"
+                    style={{
+                      transform: `rotate(${currentRotation}deg) ${
+                        isInverted ? "rotate(180deg)" : ""
+                      }`,
+                    }}
+                  />
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                    <Maximize2 className="w-4 h-4 text-amber-400 drop-shadow" />
+                  </div>
+                </>
               ) : (
                 <div className="flex flex-col items-center justify-center gap-1 text-[9px] text-neutral-500 text-center px-1">
                   {isLoadingPreview ? (
@@ -734,6 +758,140 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
           />
         </div>
       </div>
+
+      {/* Enlarged Cutout Inspection Modal */}
+      {isPreviewModalOpen && activePreview && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 select-none"
+          onClick={() => setIsPreviewModalOpen(false)}
+        >
+          <div
+            className="bg-neutral-900 border border-neutral-700/80 rounded-2xl shadow-2xl max-w-md w-full overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="px-5 py-3.5 border-b border-neutral-800 flex items-center justify-between bg-neutral-950/60">
+              <div className="flex items-center gap-2.5">
+                <span className="w-6 h-6 rounded-md bg-amber-500/20 text-amber-400 font-bold text-xs flex items-center justify-center">
+                  #{selectedSlot}
+                </span>
+                <div>
+                  <h3 className="text-sm font-semibold text-neutral-100">
+                    Slot #{selectedSlot} Cutout Inspection
+                  </h3>
+                  <span className="text-[11px] text-neutral-400">
+                    {activeSlotData?.shape_info.shape} • {activeSlotData?.bbox[2]}×{activeSlotData?.bbox[3]}px • {activeSlotData?.pca_angle.toFixed(1)}° Deskew
+                  </span>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setIsPreviewModalOpen(false)}
+                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 rounded-lg transition-colors cursor-pointer"
+                title="Close (Esc)"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Checkerboard Transparency Canvas */}
+            <div className="relative p-6 flex items-center justify-center bg-neutral-950 min-h-64 max-h-80 overflow-hidden">
+              {/* Checkerboard Pattern */}
+              <div
+                className="absolute inset-0 opacity-20"
+                style={{
+                  backgroundImage: `linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%)`,
+                  backgroundSize: "16px 16px",
+                  backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0px",
+                }}
+              />
+
+              <img
+                src={activePreview}
+                alt={`Cutout #${selectedSlot}`}
+                className="relative max-h-64 object-contain transition-transform duration-150 drop-shadow-2xl"
+                style={{
+                  transform: `scale(${modalZoom}) rotate(${currentRotation}deg) ${
+                    isInverted ? "rotate(180deg)" : ""
+                  }`,
+                }}
+              />
+
+              {/* Floating Zoom Controls */}
+              <div className="absolute bottom-3 right-3 flex items-center gap-1 bg-neutral-900/90 backdrop-blur-md px-2 py-1 rounded-lg border border-neutral-800 shadow-md">
+                <button
+                  onClick={() => setModalZoom((prev) => Math.max(0.5, Number((prev - 0.25).toFixed(2))))}
+                  className="p-1 hover:text-amber-400 text-neutral-400 cursor-pointer"
+                  title="Zoom Out"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+                <span className="text-[10px] font-mono font-bold text-neutral-300 w-10 text-center">
+                  {Math.round(modalZoom * 100)}%
+                </span>
+                <button
+                  onClick={() => setModalZoom((prev) => Math.min(3, Number((prev + 0.25).toFixed(2))))}
+                  className="p-1 hover:text-amber-400 text-neutral-400 cursor-pointer"
+                  title="Zoom In"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Quality Diagnosis Notice */}
+            <div className="p-4 bg-neutral-900/90 border-t border-neutral-800 space-y-3">
+              <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200/90 leading-relaxed">
+                <span className="font-semibold text-amber-300">Extraction Check:</span> If tray packaging, shadows, or neighboring nails are visible in the cutout, use the Pen Tool or Bounding Box handles to trim them out.
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-between gap-2 pt-1">
+                <button
+                  onClick={handleRotationFlip}
+                  className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-neutral-200 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all"
+                  title="Flip orientation 180°"
+                >
+                  <RotateCw className="w-3.5 h-3.5" />
+                  <span>180° Flip</span>
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setIsPreviewModalOpen(false);
+                      setTrayState((prev) => ({
+                        ...prev,
+                        isManualEditMode: true,
+                        activeTool: "select",
+                      }));
+                    }}
+                    className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-neutral-200 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all"
+                  >
+                    <Move className="w-3.5 h-3.5" />
+                    <span>Adjust Handles</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setIsPreviewModalOpen(false);
+                      setTrayState((prev) => ({
+                        ...prev,
+                        activeTool: "pen",
+                        isManualEditMode: false,
+                      }));
+                    }}
+                    className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-neutral-950 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all shadow-md"
+                  >
+                    <PenTool className="w-3.5 h-3.5" />
+                    <span>Edit with Pen Tool</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
