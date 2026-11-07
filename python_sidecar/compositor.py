@@ -1,204 +1,147 @@
 """
-Press-On Nail Studio - Phase 4 Preview: 6-Pass PBR Studio Relighting & Compositing Engine
-Transforms raw tray-extracted nails into photorealistic studio-lit nails matched to the hand:
-  Pass 1: Intrinsic Albedo Recovery (supports both Monochrome Solid & French-Tip / Nail-Art sets)
-  Pass 2: 3D Cylindrical & Longitudinal Apex Surface Normal Map Generation
-  Pass 3: Studio Key + Fill Diffuse Shading & Sheer Nail-Bed Subsurface Translucency
-  Pass 4: High-Gloss Gel Topcoat Anisotropic Softbox Reflection & Secondary Rim Sheen
-  Pass 5: Cuticle & Sidewall Skin-Fold Tuck Mask + Warm Subsurface Contact AO
-  Pass 6: Under-Tip Fingertip Cast Shadow, Sensor Micro-Grain & Anti-Aliased Composite
+Press-On Nail Studio - True-Texture PBR Studio Relighting & Compositing Engine
+(docs/true-texture-composition-plan.md, Steps 3 & 4)
+
+Transforms raw tray-extracted nails into photorealistic studio-lit nails matched to the hand
+while preserving 100% of photographic texture (nail art, gold charms, cat-eye shimmer,
+French smile lines, and sheer ombré gradients):
+
+  Pass 1: Surgical Glare-Tick Inpainting & Perimeter Edge-Fringe Cleanup
+  Pass 2: Anatomical Cuticle Pocket Tuck & Contact AO Generation
+  Pass 3: 3D Cylindrical Surface Normal Mapping & Non-Destructive Diffuse Relighting
+  Pass 4: Sheer Nail-Bed Subsurface Translucency (Texture-Preserving)
+  Pass 5: Adaptive High-Gloss Gel Topcoat Reflection & Softbox Window Sheen
+  Pass 6: Fingertip Cast Shadow, Sensor Micro-Grain & Sub-Pixel Anti-Aliased Composite
 """
 
 from typing import Tuple, Dict, Any
 import cv2
 import numpy as np
+import scipy.ndimage
 from warping import build_cuticle_pocket_mask
+
+
+def clean_tray_glare_preserving_texture(nail_rgba: np.ndarray) -> np.ndarray:
+    """
+    Surgically heals pinpoint overhead lightbox glare ticks from an extracted RGBA nail
+    while preserving 100% of the true photographed texture (floral nail art, 3D gold charms,
+    gold stripes, cat-eye magnetic shimmer, French smile lines, and sheer ombré gradients).
+
+    Pipeline:
+      1. Start with 100% original RGB pixels (out = nail_rgba.copy()).
+      2. Compute white top-hat on CIE LAB luminance (L) scaled to nail width (~16% nail_w).
+      3. Isolate overhead light ticks via 4 strict criteria:
+         - Sharp local luminance spike: tophat_L > 22.0 and L > 200.0
+         - Desaturated / achromatic reflection: HSV S < 24.0
+         - Interior / width test: CC horizontal width < 0.22 * nail_w and not a French tip
+         - Small connected-component area: blob area < 3.5% of valid nail pixels and not horizontal stripe
+      4. Surgical fast-marching inpainting (cv2.inpaint with INPAINT_TELEA) + Gaussian feather blend.
+      5. Perimeter edge-fringe cleanup: replace outer 2-3px ring with nearest interior pixels
+         via distance transform to prevent white backing card halo leakage.
+
+    Everything outside the glare mask and edge ring is byte-identical to the input.
+    """
+    out: np.ndarray = nail_rgba.copy()
+    alpha: np.ndarray = out[:, :, 3]
+    valid: np.ndarray = alpha > 128
+    if not np.any(valid):
+        return out
+
+    ys, xs = np.where(valid)
+    y_top: int = int(ys.min())
+    y_bot: int = int(ys.max())
+    nail_h: float = max(1.0, float(y_bot - y_top + 1))
+    x_left: int = int(xs.min())
+    x_right: int = int(xs.max())
+    nail_w: float = max(1.0, float(x_right - x_left + 1))
+    n_valid: int = int(np.sum(valid))
+
+    # Kernel size scales with nail width (~16% of nail width, minimum 7) so rectangular
+    # lightbox reflections (~10-15% nail_w) are captured cleanly across 60px to 900px nails.
+    k_tophat: int = max(7, int(round(nail_w * 0.16)) | 1)
+    kernel_tophat: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_tophat, k_tophat))
+
+    bgr: np.ndarray = out[:, :, :3]
+    lab: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L_chan: np.ndarray = lab[:, :, 0]
+    hsv: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    sat: np.ndarray = hsv[:, :, 1]
+
+    tophat_L: np.ndarray = cv2.morphologyEx(L_chan, cv2.MORPH_TOPHAT, kernel_tophat)
+
+    # Condition 1 & 2: Local luminance spike + high L + achromatic S
+    # Core seed identifies unambiguous overhead lightbox glare reflections
+    glare_seed: np.ndarray = valid & (tophat_L > 20.0) & (L_chan > 190.0) & (sat < 24.0)
+    # Expansion mask captures the surrounding anti-aliased glare reflection halo
+    glare_expand: np.ndarray = valid & (tophat_L > 10.0) & (L_chan > 160.0) & (sat < 32.0)
+
+    # Condition 3 & 4: Connected component geometric isolation
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(glare_expand.astype(np.uint8))
+    glare_mask: np.ndarray = np.zeros_like(valid, dtype=bool)
+
+    for i in range(1, num_labels):
+        if not np.any(glare_seed[labels == i]):
+            continue
+        bx, by, bw, bh, area = stats[i]
+        # Condition 4: Small CC area < 3.5% of valid nail pixels
+        if area > 0.035 * n_valid:
+            continue
+        # Vertically elongated or pinpoint (not wide horizontal stripes or charms)
+        if bw > 2.5 * bh and bw > 0.15 * nail_w:
+            continue
+        # Condition 3: Not a White French Tip (which spans across the tip width)
+        if (by - y_top) <= 0.14 * nail_h and bw >= 0.22 * nail_w:
+            continue
+        if bw >= 0.22 * nail_w:
+            continue
+
+        glare_mask |= (labels == i)
+
+    # Surgical fast-marching inpainting with feather blending
+    if np.any(glare_mask):
+        k_dilate: int = max(3, int(round(nail_w * 0.015)) | 1)
+        dil_kernel: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dilate, k_dilate))
+        dilated_glare: np.ndarray = cv2.dilate(glare_mask.astype(np.uint8), dil_kernel)
+
+        inpaint_radius: float = max(2.0, round(nail_w * 0.015, 1))
+        inpainted_bgr: np.ndarray = cv2.inpaint(
+            out[:, :, :3], dilated_glare, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA
+        )
+
+        sigma: float = max(1.0, nail_w * 0.008)
+        k_blur: int = max(3, int(round(sigma * 4)) | 1)
+        feather: np.ndarray = cv2.GaussianBlur(dilated_glare.astype(np.float32), (k_blur, k_blur), sigma)[:, :, None]
+        feather = np.clip(feather, 0.0, 1.0)
+        out[:, :, :3] = np.clip(
+            out[:, :, :3].astype(np.float32) * (1.0 - feather) + inpainted_bgr.astype(np.float32) * feather,
+            0,
+            255,
+        ).astype(np.uint8)
+
+    # 2-3px Perimeter Edge-Fringe Cleanup:
+    # Replaces the outer 2-3px ring with the nearest interior pixel via distance transform,
+    # ensuring zero white backing-card pixels leak into the anti-aliased edge.
+    fringe_px: int = max(1, min(4, int(round(nail_w * 0.009))))
+    k_fringe: int = fringe_px * 2 + 1
+    kernel_fringe: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_fringe, k_fringe))
+    clean_interior: np.ndarray = cv2.erode((alpha > 200).astype(np.uint8), kernel_fringe) > 0
+    if not np.any(clean_interior):
+        clean_interior = alpha > 128
+    edge_ring: np.ndarray = (alpha > 25) & (~clean_interior)
+
+    if np.any(clean_interior) and np.any(edge_ring):
+        _, indices = scipy.ndimage.distance_transform_edt(~clean_interior, return_distances=True, return_indices=True)
+        out[edge_ring, :3] = out[indices[0][edge_ring], indices[1][edge_ring], :3]
+
+    return out
 
 
 def recover_clean_nail_albedo(nail_rgba: np.ndarray) -> np.ndarray:
     """
-    Removes baked-in packaging tray lighting artifacts from an extracted RGBA nail while
-    automatically distinguishing between:
-      A. Monochrome Solid Nails: strips out both specular glare streaks and dark slot edge shadows.
-      B. Multi-Tone / French-Tip / Nail-Art Nails: reconstructs a 100% bilaterally symmetric,
-         razor-sharp French-tip smile line with full crescent wings and a warm, de-glared sheer
-         blush-pink base.
+    Backward-compatible alias for clean_tray_glare_preserving_texture.
+    Preserves 100% of photographic texture while surgically removing tray glare ticks.
     """
-    out = nail_rgba.copy()
-    alpha = out[:, :, 3].astype(np.float32) / 255.0
-    h, w = alpha.shape[:2]
-
-    valid = alpha > 0.5
-    if not np.any(valid):
-        return out
-
-    lab = cv2.cvtColor(out[:, :, :3], cv2.COLOR_BGR2LAB).astype(np.float32)
-    L_chan = lab[:, :, 0]
-    A_chan = lab[:, :, 1]
-    B_chan = lab[:, :, 2]
-
-    hsv = cv2.cvtColor(out[:, :, :3], cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat = hsv[:, :, 1]
-
-    # Check if the nail has a French Tip or multi-tone design by comparing centerline
-    # luminance in the free-edge tip zone (y = 0.06..0.24*h) vs the main nail bed (y = 0.42..0.82*h)
-    cx0, cx1 = int(w * 0.30), max(int(w * 0.30) + 1, int(w * 0.70))
-    tip_slice = L_chan[int(h * 0.06):int(h * 0.24), cx0:cx1]
-    body_slice = L_chan[int(h * 0.42):int(h * 0.82), cx0:cx1]
-
-    tip_med_L = float(np.median(tip_slice)) if tip_slice.size > 0 else 100.0
-    body_med_L = float(np.median(body_slice)) if body_slice.size > 0 else 100.0
-
-    is_french_or_multitone = abs(body_med_L - tip_med_L) > 38.0
-
-    if is_french_or_multitone:
-        # --- PATH B: FRENCH TIP / MULTI-TONE NAIL ---
-        # 1. Measure the clean base pigment in the lower-middle nail body (y = 0.44..0.86*h)
-        body_mask = np.zeros((h, w), dtype=bool)
-        body_mask[int(h * 0.44):int(h * 0.86), int(w * 0.22):int(w * 0.78)] = True
-        body_mask = body_mask & (alpha > 0.85) & (L_chan > 110.0)
-
-        if np.any(body_mask):
-            p25 = float(np.percentile(L_chan[body_mask], 20))
-            p75 = float(np.percentile(L_chan[body_mask], 75))
-            clean_body = body_mask & (L_chan >= p25) & (L_chan <= p75)
-            if not np.any(clean_body):
-                clean_body = body_mask
-            base_L = float(np.median(L_chan[clean_body]))
-            base_A = float(np.median(A_chan[clean_body]))
-            base_B = float(np.median(B_chan[clean_body]))
-        else:
-            base_L, base_A, base_B = 188.0, 135.0, 134.0
-
-        # 2. Measure the French Tip smile-line center depth (y_center) directly from the nail's centerline
-        active_ys = np.where(np.max(alpha, axis=1) > 0.2)[0]
-        y_top_edge = int(active_ys[0]) if len(active_ys) > 0 else 0
-        y_bot_edge = int(active_ys[-1]) if len(active_ys) > 0 else h - 1
-        nail_h = max(1.0, float(y_bot_edge - y_top_edge))
-
-        center_col_L = np.median(L_chan[:, int(w * 0.44):max(int(w * 0.44) + 1, int(w * 0.56))], axis=1)
-        dark_rows = np.where((center_col_L < 115.0) & (np.arange(h) < y_top_edge + 0.45 * nail_h))[0]
-        if len(dark_rows) > 0:
-            y_smile_center = float(np.max(dark_rows))
-        else:
-            y_smile_center = y_top_edge + 0.21 * nail_h
-
-        # Construct a 100% bilaterally symmetric, C2-smooth U-shaped French smile-line curve
-        # using per-row normalized horizontal coordinate u_row(y, x) in [-1, 1] relative to the
-        # nail's actual alpha width at each row y!
-        row_centers = np.full(h, 0.5 * float(w - 1), dtype=np.float32)
-        row_half_ws = np.full(h, max(5.0, 0.35 * float(w)), dtype=np.float32)
-        for ry in range(y_top_edge, y_bot_edge + 1):
-            r_xs = np.where(alpha[ry] > 0.15)[0]
-            if len(r_xs) >= 2:
-                row_centers[ry] = 0.5 * float(r_xs[0] + r_xs[-1])
-                # Use 0.86 of the row half-width so the French tip wings reach full depth inside the sidewall tuck
-                row_half_ws[ry] = max(3.0, 0.43 * float(r_xs[-1] - r_xs[0]))
-        row_half_ws = cv2.GaussianBlur(row_half_ws.reshape(-1, 1), (1, 15), 3.5).ravel()
-
-        x_grid = np.arange(w, dtype=np.float32)[None, :]
-        y_grid = np.arange(h, dtype=np.float32)[:, None]
-        u_norm = np.clip((x_grid - row_centers[:, None]) / row_half_ws[:, None], -1.25, 1.25)
-
-        wing_drop = 0.23 * nail_h
-        y_smile_curve = y_smile_center + wing_drop * (np.abs(u_norm) ** 2.0)
-
-        # Sub-pixel anti-aliased transition across the smile line (1.2px feather)
-        smile_analytic = np.clip((y_smile_curve - y_grid) / 1.25 + 0.5, 0.0, 1.0)
-        tip_darkness = np.clip(smile_analytic, 0.0, 1.0)
-
-        # 3. Reconstruct warm, rosy sheer-blush studio base for the Nude-Pink region
-        # (Warming LAB A & B slightly so the pale card-lit pink matches a warm human nail bed)
-        studio_pink_L = float(np.clip(base_L + 1.0, 180.0, 196.0))
-        studio_pink_A = float(np.clip(base_A + 4.2, 137.5, 144.0))
-        studio_pink_B = float(np.clip(base_B + 2.2, 134.5, 140.0))
-
-        pink_glare = np.clip((L_chan - (base_L + 5.0)) / 9.0, 0.0, 1.0)
-        pink_shadow = np.clip(((base_L - 5.0) - L_chan) / 11.0, 0.0, 1.0) * (1.0 - tip_darkness)
-        pink_defect = cv2.GaussianBlur(np.clip(pink_glare + pink_shadow, 0.0, 1.0), (9, 9), 2.5)
-
-        clean_pink_L = (1.0 - pink_defect) * L_chan + pink_defect * studio_pink_L
-        clean_pink_L = 0.82 * studio_pink_L + 0.18 * cv2.GaussianBlur(clean_pink_L, (17, 17), 4.5)
-        clean_pink_A = np.full_like(A_chan, studio_pink_A)
-        clean_pink_B = np.full_like(B_chan, studio_pink_B)
-
-        # 4. Rich, deep jet-black gel lacquer for the French Tip
-        tip_L = np.full_like(L_chan, 12.0)
-        tip_A = np.full_like(A_chan, 128.0)
-        tip_B = np.full_like(B_chan, 127.0)
-
-        final_L = (1.0 - tip_darkness) * clean_pink_L + tip_darkness * tip_L
-        final_A = (1.0 - tip_darkness) * clean_pink_A + tip_darkness * tip_A
-        final_B = (1.0 - tip_darkness) * clean_pink_B + tip_darkness * tip_B
-
-        reconstructed_lab = np.stack([
-            np.clip(final_L, 0, 255),
-            np.clip(final_A, 0, 255),
-            np.clip(final_B, 0, 255),
-        ], axis=-1).astype(np.uint8)
-
-        out[:, :, :3] = cv2.cvtColor(reconstructed_lab, cv2.COLOR_LAB2BGR)
-        return out
-
-    # --- PATH A: MONOCHROME SOLID NAIL ---
-    k_core = max(5, int(min(h, w) * 0.14) | 1)
-    kernel_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_core, k_core))
-    interior_mask = cv2.erode((alpha > 0.85).astype(np.uint8), kernel_core) > 0
-    if not np.any(interior_mask):
-        interior_mask = valid
-
-    L_int = L_chan[interior_mask]
-    p25 = float(np.percentile(L_int, 25))
-    p75 = float(np.percentile(L_int, 75))
-    clean_pigment_mask = interior_mask & (L_chan >= p25) & (L_chan <= p75)
-
-    if np.any(clean_pigment_mask):
-        base_L = float(np.median(L_chan[clean_pigment_mask]))
-        base_A = float(np.median(A_chan[clean_pigment_mask]))
-        base_B = float(np.median(B_chan[clean_pigment_mask]))
-    else:
-        base_L = float(np.median(L_int))
-        base_A = float(np.median(A_chan[interior_mask]))
-        base_B = float(np.median(B_chan[interior_mask]))
-
-    clean_sat = float(np.median(sat[clean_pigment_mask])) if np.any(clean_pigment_mask) else 60.0
-
-    glare_score = np.clip((L_chan - (base_L + 9.0)) / 16.0, 0.0, 1.0)
-    desat_score = np.clip(((clean_sat - 7.0) - sat) / max(12.0, clean_sat * 0.45), 0.0, 1.0)
-    glare_weight = np.maximum(
-        glare_score,
-        desat_score * np.clip((L_chan - (base_L - 8.0)) / 14.0, 0.0, 1.0),
-    )
-
-    k_glare = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    glare_weight = cv2.dilate(glare_weight, k_glare)
-    glare_weight = cv2.GaussianBlur(glare_weight, (15, 15), 4.5)
-
-    shadow_weight = np.clip(((base_L - 3.0) - L_chan) / 13.0, 0.0, 1.0)
-    shadow_weight = cv2.GaussianBlur(shadow_weight, (15, 15), 4.5)
-
-    defect_weight = np.clip(glare_weight + shadow_weight, 0.0, 1.0)
-
-    clean_L_field = np.where(defect_weight > 0.22, base_L, L_chan)
-    clean_A_field = np.where(defect_weight > 0.22, base_A, A_chan)
-    clean_B_field = np.where(defect_weight > 0.22, base_B, B_chan)
-
-    clean_L_field = cv2.GaussianBlur(clean_L_field, (31, 31), 10.0)
-    clean_A_field = cv2.GaussianBlur(clean_A_field, (31, 31), 10.0)
-    clean_B_field = cv2.GaussianBlur(clean_B_field, (31, 31), 10.0)
-
-    final_L = 0.76 * base_L + 0.24 * clean_L_field
-    final_A = 0.82 * base_A + 0.18 * clean_A_field
-    final_B = 0.82 * base_B + 0.18 * clean_B_field
-
-    reconstructed_lab = np.stack([
-        np.clip(final_L, 0, 255),
-        np.clip(final_A, 0, 255),
-        np.clip(final_B, 0, 255),
-    ], axis=-1).astype(np.uint8)
-
-    out[:, :, :3] = cv2.cvtColor(reconstructed_lab, cv2.COLOR_LAB2BGR)
-    return out
+    return clean_tray_glare_preserving_texture(nail_rgba)
 
 
 def compute_3d_nail_geometry(
@@ -269,15 +212,25 @@ def composite_nail_pbr(
     target: Dict[str, Any],
 ) -> None:
     """
-    Executes the 6-pass PBR studio relighting and compositing pipeline on a single warped nail ROI,
-    matching the studio key/fill lighting and natural high-gloss gel reflections of hand-template.jpg.
+    Executes the 6-pass True-Texture PBR studio relighting and compositing pipeline on a warped nail ROI.
+
+    Key improvements (Steps 3 & 4):
+      - 3D Cylindrical Diffuse Ratio constrained to [0.84, 1.04]: center dome |u|<0.55 stays at
+        0.97-1.03 (preserving 100% original color/pattern contrast), with smooth cosine roll-off
+        to 0.84 on the shaded sidewall and 0.90 on the lit sidewall.
+      - 0.88 gentle contact AO tuck at the proximal cuticle base.
+      - Sheer nail-bed translucency restricted to max 10%, only where v_map < 0.62 AND local texture
+        variance std(L) in 9x9 is low (< 4.0), preventing washout of floral art, charms, or French tips.
+      - Removed the legacy is_light_pink diffuse override that caused color flattening.
+      - Adaptive clear-coat specular sheen: scales spec_alpha by 0.55 when interior luminance std is high
+        (e.g. 3D charms, metallic stripes, cat-eye shimmer) so reflections enhance rather than compete.
     """
     rx, ry, rw, rh = bbox
     if rw <= 0 or rh <= 0:
         return
 
-    warped_bgr = warped_roi[:, :, :3].astype(np.float32)
-    raw_alpha = warped_roi[:, :, 3].astype(np.float32) / 255.0
+    warped_bgr: np.ndarray = warped_roi[:, :, :3].astype(np.float32)
+    raw_alpha: np.ndarray = warped_roi[:, :, 3].astype(np.float32) / 255.0
 
     # Pass 1: Anatomical Cuticle & Sidewall Skin-Fold Tuck Mask
     pocket_allow, cuticle_ao = build_cuticle_pocket_mask(
@@ -290,124 +243,130 @@ def composite_nail_pbr(
         feather_sigma=1.5,
     )
 
-    tucked_alpha = raw_alpha * pocket_allow
-    alpha_smooth = cv2.GaussianBlur(tucked_alpha, (3, 3), 0.75)[:, :, None]
+    tucked_alpha: np.ndarray = raw_alpha * pocket_allow
+    alpha_smooth: np.ndarray = cv2.GaussianBlur(tucked_alpha, (3, 3), 0.75)[:, :, None]
 
     # Pass 2: 3D Cylindrical & Longitudinal Apex Normals
-    roll_offset = float(target.get("roll_offset", 0.0))
+    roll_offset: float = float(target.get("roll_offset", 0.0))
     u_map, v_map, nx, ny, nz = compute_3d_nail_geometry(tucked_alpha, roll_offset=roll_offset)
 
-    # Pass 3: Studio Key + Fill Diffuse Shading & Sheer Nail-Bed Subsurface Translucency
-    L_key = np.array([0.64, -0.14, 0.755], dtype=np.float32)
+    # Pass 3: Studio Diffuse Relighting & Sheer Subsurface Translucency
+    L_key: np.ndarray = np.array([0.64, -0.14, 0.755], dtype=np.float32)
     L_key /= np.linalg.norm(L_key)
+    ndotl_key: np.ndarray = np.clip(nx * L_key[0] + ny * L_key[1] + nz * L_key[2], 0.0, 1.0)
 
-    L_fill = np.array([-0.50, -0.05, 0.864], dtype=np.float32)
-    L_fill /= np.linalg.norm(L_fill)
+    # Measure interior luminance and local spatial texture variation
+    nail_lum: np.ndarray = 0.114 * warped_bgr[:, :, 0] + 0.587 * warped_bgr[:, :, 1] + 0.299 * warped_bgr[:, :, 2]
+    mean_L: np.ndarray = cv2.boxFilter(nail_lum, cv2.CV_32F, (9, 9))
+    mean_L2: np.ndarray = cv2.boxFilter(nail_lum ** 2, cv2.CV_32F, (9, 9))
+    local_std_L: np.ndarray = np.sqrt(np.maximum(0.0, mean_L2 - mean_L ** 2))
 
-    ndotl_key = np.clip(nx * L_key[0] + ny * L_key[1] + nz * L_key[2], 0.0, 1.0)
-    ndotl_fill = np.clip(nx * L_fill[0] + ny * L_fill[1] + nz * L_fill[2], 0.0, 1.0)
+    interior_bool: np.ndarray = tucked_alpha > 0.35
+    interior_lum_std: float = float(np.std(nail_lum[interior_bool])) if np.any(interior_bool) else 15.0
 
-    hand_patch = hand_orig[ry:ry + rh, rx:rx + rw].astype(np.float32)
-    hand_curr = composite_hand[ry:ry + rh, rx:rx + rw]
-    hand_gray = cv2.cvtColor(hand_patch.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-    hand_shading_blur = cv2.GaussianBlur(hand_gray, (25, 25), 8.0)
+    # Sheer Translucency: Restricted strictly to the proximal nail bed zone (v_map < 0.62)
+    # AND low local texture variance (std(L) in 9x9 < 4.0) to protect artwork, charms & French tips.
+    v_bed_zone: np.ndarray = np.clip((0.62 - v_map) / 0.15, 0.0, 1.0)
+    low_texture_var: np.ndarray = np.clip((4.0 - local_std_L) / 1.5, 0.0, 1.0)
+    sheer_weight: np.ndarray = 0.10 * v_bed_zone * low_texture_var
 
-    mask_bool = tucked_alpha > 0.15
-    mean_lum = float(np.mean(hand_shading_blur[mask_bool])) if np.any(mask_bool) else 172.0
-    local_hand_ratio = np.clip(hand_shading_blur / max(1.0, mean_lum), 0.84, 1.12)
-
-    right_sidewall_roll = 1.0 - 0.14 * np.clip((u_map - 0.72) / 0.28, 0.0, 1.0) ** 1.5
-    cylinder_diffuse = (0.48 + 0.46 * ndotl_key + 0.13 * ndotl_fill) * right_sidewall_roll
-    total_diffuse = cylinder_diffuse * (0.68 + 0.32 * local_hand_ratio)
-
-    apex_dome_lift = 0.94 + 0.08 * np.sin(np.clip(v_map, 0.0, 1.0) * np.pi)
-    total_diffuse *= apex_dome_lift
-
-    # Detect light/sheer nude-pink regions vs dark pigment/French tips
-    nail_lum = 0.114 * warped_bgr[:, :, 0] + 0.587 * warped_bgr[:, :, 1] + 0.299 * warped_bgr[:, :, 2]
-    is_light_pink = np.clip((nail_lum - 125.0) / 45.0, 0.0, 1.0)
-
-    # For sheer nude-pink regions, blend 24% with a smoothed version of the underlying natural
-    # rosy nail-bed skin tone so the press-on has authentic sheer acrylic depth & warmth!
-    hand_bed_smooth = cv2.GaussianBlur(hand_patch, (19, 19), 5.0)
-    sheer_translucency = is_light_pink * np.clip((0.78 - v_map) / 0.20, 0.0, 1.0)
-    base_with_subsurface = (
-        warped_bgr * (1.0 - 0.24 * sheer_translucency[:, :, None])
-        + hand_bed_smooth * (0.24 * sheer_translucency[:, :, None])
+    hand_patch: np.ndarray = hand_orig[ry:ry + rh, rx:rx + rw].astype(np.float32)
+    hand_bed_smooth: np.ndarray = cv2.GaussianBlur(hand_patch, (19, 19), 5.0)
+    base_with_subsurface: np.ndarray = (
+        warped_bgr * (1.0 - sheer_weight[:, :, None]) + hand_bed_smooth * sheer_weight[:, :, None]
     )
 
-    effective_diffuse = (1.0 - is_light_pink) * total_diffuse + is_light_pink * (0.26 + 0.74 * total_diffuse)
-    soft_cuticle_ao = 1.0 - 0.72 * (1.0 - cuticle_ao)
-    lit_bgr = base_with_subsurface * effective_diffuse[:, :, None] * soft_cuticle_ao[:, :, None]
-
-    # Subtle Fresnel grazing rim reflection along the extreme left edge
-    left_rim_mask = np.clip((-u_map - 0.74) / 0.24, 0.0, 1.0) ** 2.0 * np.sin(np.clip(v_map, 0.05, 0.92) * np.pi)
-    env_color = np.array([205.0, 208.0, 216.0], dtype=np.float32)[None, None, :]
-    lit_bgr = lit_bgr + left_rim_mask[:, :, None] * 0.10 * env_color
-
-    # Pass 4: High-Gloss Clear Gel Topcoat Specular Reflections (Matched to hand-template.jpg)
-    spec_u_center = 0.33 - roll_offset * 0.45
-    u_delta = u_map - spec_u_center
-
-    # 4a. Broad studio sheen across the upper-right dome (toned down on light pink so it never washes out chroma)
-    v_sheen_env = np.sin(np.clip((v_map - 0.05) / 0.88, 0.0, 1.0) * np.pi)
-    broad_sheen = np.exp(-0.5 * (u_delta / 0.21) ** 2) * v_sheen_env * (1.0 - 0.55 * is_light_pink)
-
-    # 4b. Crisp, high-gloss softbox window reflection ribbon running up the dome and across the tip
-    v_rib_in = np.clip((v_map - 0.13) / 0.16, 0.0, 1.0)
-    v_rib_out = np.clip((0.86 - v_map) / 0.14, 0.0, 1.0)
-    apex_hotspot = 0.74 + 0.26 * np.exp(-0.5 * ((v_map - 0.48) / 0.18) ** 2)
-    v_rib_env = (v_rib_in ** 1.3) * (v_rib_out ** 1.4) * apex_hotspot
-
-    rib_half_w = 0.036 * (0.55 + 0.45 * np.sin(np.clip((v_map - 0.10) / 0.78, 0.0, 1.0) * np.pi))
-    gloss_ribbon = np.exp(-0.5 * (np.abs(u_delta) / np.maximum(0.012, rib_half_w)) ** 2.4) * v_rib_env
-
-    # 4c. Soft secondary rim sheen near the right lateral bevel
-    bevel_u_delta = u_map - (0.66 - roll_offset * 0.35)
-    bevel_v_env = np.maximum(0.0, np.sin(np.clip((v_map - 0.20) / 0.50, 0.0, 1.0) * np.pi)) ** 1.4
-    bevel_sheen = np.exp(-0.5 * (bevel_u_delta / 0.038) ** 2) * bevel_v_env * (1.0 - 0.45 * is_light_pink)
-
-    # 4d. Soft lower-left studio reflector fill sheen
-    fill_u_delta = np.abs(u_map - (-0.42 - roll_offset * 0.30))
-    fill_v_env = np.maximum(0.0, np.sin(np.clip((v_map - 0.10) / 0.48, 0.0, 1.0) * np.pi)) ** 1.3
-    fill_reflection = np.exp(-0.5 * (fill_u_delta / 0.065) ** 2.0) * fill_v_env * (1.0 - 0.55 * is_light_pink)
-
-    spec_total = (
-        0.13 * broad_sheen
-        + 0.88 * gloss_ribbon
-        + 0.11 * bevel_sheen
-        + 0.11 * fill_reflection
+    # 3D Cylindrical Diffuse Ratio: Constrained strictly to [0.84, 1.04]
+    # Center dome (|u| <= 0.55): 0.97 to 1.03, preserving 100% photographic texture/color
+    # Lateral sidewalls (|u| -> 1.0): smooth cosine roll-off down to 0.84 shaded / 0.90 lit sidewall
+    center_diffuse: np.ndarray = 0.97 + 0.06 * ndotl_key
+    u_abs: np.ndarray = np.abs(u_map)
+    t_side: np.ndarray = np.clip((u_abs - 0.55) / 0.45, 0.0, 1.0)
+    w_side: np.ndarray = 0.5 * (1.0 - np.cos(np.pi * t_side))
+    target_sidewall: np.ndarray = np.where(u_map < 0.0, 0.84, 0.90)
+    diffuse_ratio: np.ndarray = np.where(
+        u_abs <= 0.55,
+        center_diffuse,
+        (1.0 - w_side) * 1.00 + w_side * target_sidewall,
     )
-    spec_total = cv2.GaussianBlur(spec_total, (3, 3), 0.7)
+    diffuse_ratio = np.clip(diffuse_ratio, 0.84, 1.04)
 
-    spec_color = np.array([248.0, 251.0, 255.0], dtype=np.float32)[None, None, :]
-    spec_alpha = np.clip(spec_total[:, :, None], 0.0, 0.90)
-    lit_bgr = lit_bgr * (1.0 - spec_alpha * 0.78) + spec_color * spec_alpha
+    # Gentle 0.88 cuticle AO tuck at the proximal cuticle base
+    soft_cuticle_ao: np.ndarray = 0.88 + 0.12 * cuticle_ao
+    lit_bgr: np.ndarray = base_with_subsurface * (diffuse_ratio * soft_cuticle_ao)[:, :, None]
+
+    # Subtle Fresnel grazing rim reflection along the left lateral edge
+    left_rim_mask: np.ndarray = (
+        np.clip((-u_map - 0.74) / 0.24, 0.0, 1.0) ** 2.0 * np.sin(np.clip(v_map, 0.05, 0.92) * np.pi)
+    )
+    env_color: np.ndarray = np.array([205.0, 208.0, 216.0], dtype=np.float32)[None, None, :]
+    lit_bgr = lit_bgr + left_rim_mask[:, :, None] * 0.06 * env_color
+
+    # Pass 4: High-Gloss Clear Gel Topcoat Specular Reflections
+    # In studio portraiture, key light highlight sits along the dorsal crest (u ~ 0.28 to 0.35)
+    spec_u_center: float = 0.30 - roll_offset * 0.40
+    u_delta: np.ndarray = u_map - spec_u_center
+
+    # Broad studio dome sheen (subtle ambient surface gloss)
+    v_sheen_env: np.ndarray = np.sin(np.clip((v_map - 0.05) / 0.88, 0.0, 1.0) * np.pi)
+    broad_sheen: np.ndarray = np.exp(-0.5 * (u_delta / 0.18) ** 2) * v_sheen_env
+
+    # Crisp, glassy vertical softbox window reflection ribbon matching real salon gel topcoat
+    v_rib_in: np.ndarray = np.clip((v_map - 0.10) / 0.15, 0.0, 1.0)
+    v_rib_out: np.ndarray = np.clip((0.90 - v_map) / 0.12, 0.0, 1.0)
+    apex_hotspot: np.ndarray = 0.80 + 0.20 * np.exp(-0.5 * ((v_map - 0.48) / 0.22) ** 2)
+    v_rib_env: np.ndarray = (v_rib_in ** 1.2) * (v_rib_out ** 1.3) * apex_hotspot
+
+    # Crisp, sharp ribbon width (half-width ~ 0.026) for mirror-like polish reflection
+    rib_half_w: np.ndarray = 0.026 * (0.60 + 0.40 * np.sin(np.clip((v_map - 0.08) / 0.82, 0.0, 1.0) * np.pi))
+    gloss_ribbon: np.ndarray = np.exp(-0.5 * (np.abs(u_delta) / np.maximum(0.008, rib_half_w)) ** 2.2) * v_rib_env
+
+    # Secondary lateral fill sheen
+    fill_u_delta: np.ndarray = np.abs(u_map - (-0.46 - roll_offset * 0.30))
+    fill_v_env: np.ndarray = np.maximum(0.0, np.sin(np.clip((v_map - 0.10) / 0.55, 0.0, 1.0) * np.pi)) ** 1.2
+    fill_reflection: np.ndarray = np.exp(-0.5 * (fill_u_delta / 0.055) ** 2.0) * fill_v_env
+
+    spec_total: np.ndarray = (
+        0.08 * broad_sheen
+        + 1.05 * gloss_ribbon
+        + 0.09 * fill_reflection
+    )
+    spec_total = cv2.GaussianBlur(spec_total, (3, 3), 0.5)
+
+    # Adaptive Clear-Coat Specular: Scale down spec_alpha by 0.55 when interior luminance
+    # std-dev is high (cat-eye shimmer, 3D charms, metallic nail art)
+    high_contrast_weight: float = float(np.clip((interior_lum_std - 18.0) / 10.0, 0.0, 1.0))
+    spec_scale: float = 1.0 - 0.45 * high_contrast_weight
+
+    spec_color: np.ndarray = np.array([252.0, 254.0, 255.0], dtype=np.float32)[None, None, :]
+    spec_alpha: np.ndarray = np.clip(spec_total[:, :, None] * spec_scale, 0.0, 0.95)
+    lit_bgr = lit_bgr * (1.0 - spec_alpha * 0.84) + spec_color * spec_alpha
 
     # Pass 5: Warm Skin Subsurface Scatter / Cuticle Rim Integration
-    cuticle_edge_band = np.clip((1.0 - cuticle_ao) * 3.0, 0.0, 1.0) * np.clip(1.0 - v_map * 3.2, 0.0, 1.0)
-    warm_skin_tint = hand_patch * 0.82
+    cuticle_edge_band: np.ndarray = np.clip((1.0 - cuticle_ao) * 3.0, 0.0, 1.0) * np.clip(1.0 - v_map * 3.2, 0.0, 1.0)
+    warm_skin_tint: np.ndarray = hand_patch * 0.82
     lit_bgr = (
         lit_bgr * (1.0 - 0.18 * cuticle_edge_band[:, :, None])
         + warm_skin_tint * (0.18 * cuticle_edge_band[:, :, None])
     )
 
-    # Pass 6: Match camera sensor micro-grain from hand-template.jpg
-    rng = np.random.default_rng(seed=int(rx * 31 + ry * 17))
-    sensor_grain = rng.normal(0.0, 1.15, size=(rh, rw, 1)).astype(np.float32)
+    # Pass 6: Camera sensor micro-grain matching hand-template.jpg & under-tip cast shadow
+    rng: np.random.Generator = np.random.default_rng(seed=int(rx * 31 + ry * 17))
+    sensor_grain: np.ndarray = rng.normal(0.0, 1.15, size=(rh, rw, 1)).astype(np.float32)
     lit_bgr = np.clip(lit_bgr + sensor_grain, 0.0, 255.0)
 
-    # Under-Tip Fingertip Cast Shadow
-    M_sh = np.float32([[1.0, 0.0, -1.2], [0.0, 1.0, 3.2]])
-    shifted_alpha = cv2.warpAffine(tucked_alpha, M_sh, (rw, rh), flags=cv2.INTER_LINEAR)
-    shadow_blur = cv2.GaussianBlur(shifted_alpha, (9, 9), 2.5)
+    # Under-Tip Fingertip Cast Shadow (directional light from upper-left casts shadow downward-right)
+    M_sh: np.ndarray = np.float32([[1.0, 0.0, 1.6], [0.0, 1.0, 4.2]])
+    shifted_alpha: np.ndarray = cv2.warpAffine(tucked_alpha, M_sh, (rw, rh), flags=cv2.INTER_LINEAR)
+    shadow_blur: np.ndarray = cv2.GaussianBlur(shifted_alpha, (11, 11), 3.2)
 
-    patch_hsv = cv2.cvtColor(hand_patch.astype(np.uint8), cv2.COLOR_BGR2HSV)
-    skin_weight = np.clip((patch_hsv[:, :, 1].astype(np.float32) - 18.0) / 25.0, 0.0, 1.0)
-    under_shadow_mult = 1.0 - 0.18 * shadow_blur * (1.0 - tucked_alpha) * skin_weight
-    hand_with_shadow = hand_curr * under_shadow_mult[:, :, None]
+    patch_hsv: np.ndarray = cv2.cvtColor(hand_patch.astype(np.uint8), cv2.COLOR_BGR2HSV)
+    skin_weight: np.ndarray = np.clip((patch_hsv[:, :, 1].astype(np.float32) - 18.0) / 25.0, 0.0, 1.0)
+    under_shadow_mult: np.ndarray = 1.0 - 0.28 * shadow_blur * (1.0 - tucked_alpha) * skin_weight
+    hand_curr: np.ndarray = composite_hand[ry:ry + rh, rx:rx + rw]
+    hand_with_shadow: np.ndarray = hand_curr * under_shadow_mult[:, :, None]
 
-    # Final sub-pixel anti-aliased composite
+    # Sub-pixel anti-aliased composite
     composite_hand[ry:ry + rh, rx:rx + rw] = (
         lit_bgr * alpha_smooth + hand_with_shadow * (1.0 - alpha_smooth)
     )

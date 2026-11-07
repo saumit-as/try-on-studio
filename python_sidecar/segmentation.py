@@ -1,29 +1,189 @@
 """
-Press-On Nail Studio - Nail Tray Segmentation & Shape Classifier
+Press-On Nail Studio - Nail Tray Segmentation, Rectification & Shape Classifier
+(docs/true-texture-composition-plan.md, Steps 1 & 2)
+
 Implements:
-  - Universal White Card ROI & hierarchical tray row/slot valley detection
-  - Direct solid body segmentation for both dark monochrome and light/French-tip/nail-art sets
-  - Dense 2D Area-Moment Principal Axis deskewing (zero sparse-hull vertex bias)
-  - Automatic 180-degree inversion detection for upside-down tray nails
-  - Bilaterally symmetric single-arc super-ellipse contour smoothing
-  - Geometric tip shape classification (Square, Coffin, Almond, Oval, Stiletto)
+  - Step 1: Backing card perspective rectification (rectify_backing_card)
+  - Step 2.1: Multi-cue foreground detection for white French tips, sheer cuticles & angled tray
+  - Step 2.2: Data-driven bilateral profile smoothing with monotonic envelopes (build_symmetric_smooth_nail_mask)
+  - Extra A: Minimal 2px-3px edge-fringe cleanup with zero interior pixel fabrication
+  - Extra B: Geometric shape classification including Squoval (classify_nail_shape)
+  - Coordinate contract: homography transformation and card_quad preservation
 """
 
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from scipy.signal import find_peaks
-from typing import List, Dict, Tuple, Optional, Any
+import scipy.signal
+
+
+def order_quad_points(pts: np.ndarray) -> np.ndarray:
+    """
+    Orders 4 points as [top_left, top_right, bottom_right, bottom_left] in clockwise order.
+    Handles arbitrary 2D quadrilateral rotations and camera perspective tilts.
+    """
+    pts = pts.reshape(4, 2).astype(np.float64)
+    center = np.mean(pts, axis=0)
+    # Sort counter-clockwise by polar angle from center
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    ccw_order = pts[np.argsort(angles)]
+    cw_order = ccw_order[::-1]
+
+    # Find corner index corresponding to Top-Left:
+    # In standard image coordinates (x right, y down), the top edge vector p0 -> p1
+    # points left-to-right (angle between -45 deg and +45 deg), with minimal (x + y).
+    best_tl_idx = 0
+    min_dist_to_tl = float("inf")
+    for i in range(4):
+        p0 = cw_order[i]
+        p1 = cw_order[(i + 1) % 4]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        ang_deg = np.degrees(np.arctan2(dy, dx))
+        if -45.0 <= ang_deg <= 45.0:
+            dist = float(p0[0] + p0[1])
+            if dist < min_dist_to_tl:
+                min_dist_to_tl = dist
+                best_tl_idx = i
+
+    ordered = np.roll(cw_order, -best_tl_idx, axis=0)
+    return ordered
+
+
+def rectify_backing_card(
+    image: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Detects the white presentation backing card inside the packaging box, checks for camera
+    perspective tilt (> 1.5 deg) or perspective foreshortening (> 3%), and computes the
+    fronto-parallel perspective rectification homography H (mapping ORIGINAL -> rectified coords).
+
+    Returns:
+        (rectified_img, H, card_quad)
+        where H is 3x3 float64, and card_quad is (4, 2) float64 [TL, TR, BR, BL] in original coordinates.
+        When no rectification is needed, returns (image, np.eye(3), None).
+    """
+    h_img, w_img = image.shape[:2]
+    # Work on scale-normalized copy for fast, noise-robust card contour detection
+    scale: float = min(1.0, 1000.0 / float(max(h_img, w_img)))
+    sw: int = int(round(w_img * scale))
+    sh: int = int(round(h_img * scale))
+    small: np.ndarray = (
+        cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA) if scale < 1.0 else image
+    )
+
+    gray: np.ndarray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    hsv: np.ndarray = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    sat: np.ndarray = hsv[:, :, 1]
+
+    # White backing card binary mask
+    card_bin: np.ndarray = ((gray > 165) & (sat < 40)).astype(np.uint8) * 255
+    k_close: int = max(5, int(min(sw, sh) * 0.008) | 1)
+    card_closed: np.ndarray = cv2.morphologyEx(
+        card_bin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
+    )
+
+    cnts, _ = cv2.findContours(card_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: List[Tuple[float, np.ndarray]] = []
+    total_area: float = float(sw * sh)
+    for c in cnts:
+        a: float = float(cv2.contourArea(c))
+        if a > total_area * 0.15:
+            M = cv2.moments(c)
+            cy: float = (M["m01"] / M["m00"]) if M["m00"] > 0 else sh / 2.0
+            # Reject/penalize mirror reflections in the upper box lid (cy / sh < 0.35)
+            score: float = a
+            if (cy / float(sh)) < 0.35:
+                score *= 0.1
+            candidates.append((score, c))
+
+    if not candidates:
+        return image, np.eye(3, dtype=np.float64), None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_c: np.ndarray = candidates[0][1]
+
+    # Fit 4 corners: approxPolyDP with escalating epsilon (0.015 to 0.065)
+    peri: float = float(cv2.arcLength(best_c, True))
+    poly4: Optional[np.ndarray] = None
+    for eps_frac in np.linspace(0.015, 0.065, 20):
+        approx = cv2.approxPolyDP(best_c, eps_frac * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            poly4 = approx.reshape(4, 2).astype(np.float64) / scale
+            break
+
+    # Fallback to minAreaRect if approxPolyDP did not find a 4-vertex convex quad
+    rect = cv2.minAreaRect(best_c)
+    box = cv2.boxPoints(rect).astype(np.float64) / scale
+    if poly4 is None:
+        poly4 = box
+
+    # Order quad points as [TL, TR, BR, BL]
+    quad_orig = order_quad_points(poly4)
+    tl, tr, br, bl = quad_orig
+
+    w_top = float(np.linalg.norm(tr - tl))
+    w_bot = float(np.linalg.norm(br - bl))
+    h_left = float(np.linalg.norm(bl - tl))
+    h_right = float(np.linalg.norm(br - tr))
+
+    top_dx = tr[0] - tl[0]
+    top_dy = tr[1] - tl[1]
+    top_angle_deg = abs(float(np.degrees(np.arctan2(top_dy, top_dx))))
+
+    w_diff = abs(w_top - w_bot) / max(1.0, max(w_top, w_bot))
+    h_diff = abs(h_left - h_right) / max(1.0, max(h_left, h_right))
+
+    # Tilt angle from minAreaRect
+    angle = rect[2]
+    tilt = min(abs(angle), abs(angle + 90.0), abs(angle - 90.0))
+
+    # Rectification criterion: tilt > 1.5 deg or foreshortening > 3% with non-zero tilt
+    needs_rectification = (top_angle_deg > 1.5) or (tilt > 1.5) or (w_diff > 0.03 and top_angle_deg > 0.8) or (h_diff > 0.03 and top_angle_deg > 0.8)
+
+    if not needs_rectification or (top_angle_deg < 1.5 and tilt < 1.5):
+        return image, np.eye(3, dtype=np.float64), None
+
+    # Compute fronto-parallel rectified dimensions
+    dst_w: int = int(round(max(w_top, w_bot)))
+    dst_h: int = int(round(max(h_left, h_right)))
+
+    # Ensure orientation is upright (Nail BERRIE cards have 3 horizontal rows of 5 nails)
+    if dst_w < dst_h * 0.75:
+        quad_orig = np.roll(quad_orig, -1, axis=0)
+        tl, tr, br, bl = quad_orig
+        w_top = float(np.linalg.norm(tr - tl))
+        w_bot = float(np.linalg.norm(br - bl))
+        h_left = float(np.linalg.norm(bl - tl))
+        h_right = float(np.linalg.norm(br - tr))
+        dst_w = int(round(max(w_top, w_bot)))
+        dst_h = int(round(max(h_left, h_right)))
+
+    dst_pts = np.array(
+        [[0.0, 0.0], [float(dst_w - 1), 0.0], [float(dst_w - 1), float(dst_h - 1)], [0.0, float(dst_h - 1)]],
+        dtype=np.float32,
+    )
+    H: np.ndarray = cv2.getPerspectiveTransform(quad_orig.astype(np.float32), dst_pts)
+    rectified_img: np.ndarray = cv2.warpPerspective(
+        image, H, (dst_w, dst_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+
+    return rectified_img, H.astype(np.float64), quad_orig
 
 
 def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) -> np.ndarray:
     """
-    Constructs a 100% bilaterally symmetric, C2-smooth anatomical press-on nail alpha mask
-    from a deskewed, upright binary mask (where y = 0 is the tapered free-edge tip and
-    y = h - 1 is the rounded cuticle base).
+    Constructs a 100% bilaterally symmetric, G2-smooth anatomical press-on nail alpha mask
+    from a deskewed, upright binary mask (where y = 0 is the free-edge tip and
+    y = h - 1 is the cuticle base).
 
-    Adapts both the peak-width position (t_peak) and upper super-ellipse power to the nail's
-    measured width profile so Almond nails stay gracefully tapered while Oval/Squoval
-    French-tip nails preserve their fuller rounded shoulders and crescent wings.
+    Fits an adaptive 2-piece super-elliptical profile (upper tip arch + lower cuticle U-cup)
+    blended with Savitzky-Golay smoothing so that:
+      - The equator sits naturally in the lower-middle zone (36%-48% up from the cuticle base).
+      - Both the free-edge tip (y = 0) and cuticle base (y = h - 1) terminate with a true
+        horizontal tangent (elliptical square-root cap, never a pointed sine cone).
+      - Almond, Oval, Squoval, Square, Coffin, and Stiletto tip profiles are faithfully
+        preserved via data-driven exponent fitting.
     """
     h, w = mask.shape[:2]
     if h < 10 or w < 10:
@@ -34,59 +194,174 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
         return mask
 
     y_min, y_max = int(np.min(ys)), int(np.max(ys))
-    nail_h = max(1, y_max - y_min)
-    center_x = 0.5 * (float(np.min(xs)) + float(np.max(xs)))
+    nail_h = max(1, y_max - y_min + 1)
+
+    # Compute robust horizontal center_x from the middle 50% of the nail body
+    mid_y0 = y_min + int(0.25 * nail_h)
+    mid_y1 = max(mid_y0 + 1, y_min + int(0.75 * nail_h))
+    mid_centers: List[float] = []
+    for y in range(mid_y0, min(y_max + 1, mid_y1 + 1)):
+        r_xs = np.where(mask[y, :] > 127)[0]
+        if len(r_xs) >= 2:
+            mid_centers.append(0.5 * (float(np.min(r_xs)) + float(np.max(r_xs))))
+    if mid_centers:
+        center_x = float(np.median(mid_centers))
+    else:
+        center_x = 0.5 * (float(np.min(xs)) + float(np.max(xs)))
 
     # Measure raw half-width at every scanline y in [y_min, y_max]
-    raw_half_w = np.zeros(h, dtype=np.float64)
-    for y in range(y_min, y_max + 1):
+    measured_half_w = np.zeros(nail_h, dtype=np.float64)
+    for i, y in enumerate(range(y_min, y_max + 1)):
         row_xs = np.where(mask[y, :] > 127)[0]
         if len(row_xs) >= 2:
             w_left = max(0.0, center_x - float(np.min(row_xs)))
             w_right = max(0.0, float(np.max(row_xs)) - center_x)
-            raw_half_w[y] = 0.70 * max(w_left, w_right) + 0.30 * min(w_left, w_right)
+            measured_half_w[i] = 0.52 * max(w_left, w_right) + 0.48 * min(w_left, w_right)
+        elif len(row_xs) == 1:
+            measured_half_w[i] = abs(float(row_xs[0]) - center_x)
+        else:
+            measured_half_w[i] = measured_half_w[i - 1] if i > 0 else 0.0
 
-    t_grid = np.linspace(0.0, 1.0, nail_h + 1)
-    active_w = raw_half_w[y_min:y_max + 1]
-    max_half_w = float(np.percentile(active_w, 95))
+    # Pre-smooth measured_half_w before finding the equator and monotonic envelope
+    win_pre = max(5, int(nail_h * 0.11) | 1)
+    if 5 <= win_pre < nail_h:
+        w_pre = scipy.signal.savgol_filter(measured_half_w, window_length=win_pre, polyorder=min(3, win_pre - 1))
+        w_pre = np.maximum(0.0, w_pre)
+    else:
+        w_pre = measured_half_w.copy()
 
-    # Smooth the measured width profile with a Gaussian filter
-    k_len = max(5, int(nail_h * 0.20) | 1)
-    gx = np.linspace(-2.2, 2.2, k_len)
-    g_kernel = np.exp(-0.5 * gx ** 2)
-    g_kernel /= np.sum(g_kernel)
+    # Locate the anatomical equator in the lower-middle zone [0.58 * nail_h, 0.66 * nail_h]
+    # (matching ground-truth worn nail anatomy y_eq ~ 0.64)
+    eq_start = int(0.58 * nail_h)
+    eq_end = max(eq_start + 1, int(0.66 * nail_h))
+    eq_zone = w_pre[eq_start:eq_end]
+    i_peak = eq_start + int(np.argmax(eq_zone)) if len(eq_zone) > 0 else int(0.63 * nail_h)
+    i_peak = int(np.clip(i_peak, max(4, int(0.58 * nail_h)), min(nail_h - 5, int(0.66 * nail_h))))
 
-    padded_w = np.pad(active_w, (k_len // 2, k_len // 2), mode="constant", constant_values=0.0)
-    smooth_w = np.convolve(padded_w, g_kernel, mode="valid")
+    # Enforce anatomical monotonicity toward i_peak:
+    w_mono = w_pre.copy()
+    for i in range(1, i_peak + 1):
+        if w_mono[i] < w_mono[i - 1]:
+            w_mono[i] = w_mono[i - 1]
+    for i in range(nail_h - 2, i_peak - 1, -1):
+        if w_mono[i] < w_mono[i + 1]:
+            w_mono[i] = w_mono[i + 1]
 
-    t_peak = 0.60
-    analytic_w = np.zeros_like(t_grid)
-    upper_mask = t_grid <= t_peak
-    lower_mask = t_grid > t_peak
+    w_eq = max(2.0, float(w_mono[i_peak]))
 
-    # 1. Upper Almond/Oval arc (t = 0.0 to 0.60): single continuous convex curve
-    analytic_w[upper_mask] = max_half_w * np.power(
-        np.sin((np.pi * 0.5) * (t_grid[upper_mask] / t_peak)), 0.56
-    )
-    # 2. Cuticle U-base (t = 0.60 to 1.00): smooth rounded U-curve into the proximal cuticle pocket
-    analytic_w[lower_mask] = max_half_w * np.power(
-        np.cos((np.pi * 0.5) * ((t_grid[lower_mask] - t_peak) / (1.0 - t_peak))), 0.44
-    )
+    # Fit adaptive 2-piece G2-continuous super-ellipse to w_mono:
+    # 1. Upper arch (tip y=0 to equator y=i_peak): u_tip = (i_peak - i) / i_peak in [0, 1]
+    # Ground-truth Almond/Oval reference has (p_up ~ 1.82, q_up ~ 2.18)
+    u_tip = np.linspace(1.0, 0.0, i_peak + 1, dtype=np.float64)
+    target_upper = np.clip(w_mono[: i_peak + 1] / w_eq, 0.0, 1.0)
+    fit_mask_up = (u_tip >= 0.12) & (u_tip <= 0.86)
+    best_err_up = float("inf")
+    best_p_up, best_q_up = 1.82, 2.18
+    if np.any(fit_mask_up):
+        u_sub = u_tip[fit_mask_up]
+        t_sub = target_upper[fit_mask_up]
+        for p_cand in np.linspace(1.80, 3.40, 21):
+            base_curve = np.clip(1.0 - (u_sub ** p_cand), 1e-6, 1.0)
+            for q_cand in np.linspace(2.12, 2.65, 14):
+                pred = base_curve ** (1.0 / q_cand)
+                prior = 0.0008 * ((p_cand - 1.82) ** 2 + (q_cand - 2.18) ** 2)
+                err = float(np.mean((pred - t_sub) ** 2)) + prior
+                if err < best_err_up:
+                    best_err_up = err
+                    best_p_up = float(p_cand)
+                    best_q_up = float(q_cand)
 
-    # Use 20% Gaussian-smoothed measured profile + 80% analytical super-ellipse
-    final_half_w = 0.20 * smooth_w + 0.80 * analytic_w
+    w_upper_analytic = w_eq * (np.clip(1.0 - (u_tip ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
+
+    # 2. Lower cuticle U-cup (equator y=i_peak to cuticle base y=nail_h-1): u_cut in [0, 1]
+    # Ground-truth reference has (p_low ~ 2.05, q_low ~ 2.40) for a full, rounded cuticle U-cup
+    n_lower = nail_h - i_peak
+    u_cut = np.linspace(0.0, 1.0, n_lower, dtype=np.float64)
+    target_lower = np.clip(w_mono[i_peak:] / w_eq, 0.0, 1.0)
+    fit_mask_low = (u_cut >= 0.12) & (u_cut <= 0.82)
+    best_err_low = float("inf")
+    best_p_low, best_q_low = 2.05, 2.40
+    if np.any(fit_mask_low):
+        u_sub_l = u_cut[fit_mask_low]
+        t_sub_l = target_lower[fit_mask_low]
+        for p_cand in np.linspace(2.00, 2.45, 10):
+            base_curve = np.clip(1.0 - (u_sub_l ** p_cand), 1e-6, 1.0)
+            for q_cand in np.linspace(2.30, 2.65, 9):
+                pred = base_curve ** (1.0 / q_cand)
+                prior = 0.0008 * ((p_cand - 2.05) ** 2 + (q_cand - 2.40) ** 2)
+                err = float(np.mean((pred - t_sub_l) ** 2)) + prior
+                if err < best_err_low:
+                    best_err_low = err
+                    best_p_low = float(p_cand)
+                    best_q_low = float(q_cand)
+
+    w_lower_analytic = w_eq * (np.clip(1.0 - (u_cut ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
+
+    w_analytic = np.concatenate([w_upper_analytic[:-1], w_lower_analytic])
+
+    # Heavy Savitzky-Golay smoothing on w_mono with elliptical cap rounding
+    win_len = max(7, int(nail_h * 0.25) | 1)
+    if 7 <= win_len < nail_h:
+        w_smooth = scipy.signal.savgol_filter(w_mono, window_length=win_len, polyorder=3)
+        w_smooth = np.maximum(0.0, w_smooth)
+    else:
+        w_smooth = w_mono.copy()
+
+    # Apply true elliptical (sqrt) rounding to the top 14% and bottom 16% of w_smooth
+    tip_cap_len = max(4, int(0.14 * float(nail_h)))
+    if tip_cap_len < nail_h:
+        t_cap = np.linspace(0.0, 1.0, tip_cap_len, dtype=np.float64)
+        ellip_tip = np.sqrt(np.clip(1.0 - (1.0 - t_cap) ** 2, 0.0, 1.0))
+        w_smooth[:tip_cap_len] = np.minimum(w_smooth[:tip_cap_len], w_smooth[tip_cap_len - 1] * ellip_tip)
+
+    cut_cap_len = max(5, int(0.16 * float(nail_h)))
+    if cut_cap_len < nail_h:
+        t_cut = np.linspace(0.0, 1.0, cut_cap_len, dtype=np.float64)
+        ellip_cut = np.sqrt(np.clip(1.0 - (1.0 - t_cut) ** 2, 0.0, 1.0))
+        w_smooth[nail_h - cut_cap_len :] = np.minimum(
+            w_smooth[nail_h - cut_cap_len :],
+            w_smooth[nail_h - cut_cap_len] * ellip_cut[::-1],
+        )
+
+    # Use 94% G2 super-ellipse + 6% elliptically-capped Savitzky-Golay profile
+    final_half_w = 0.94 * w_analytic + 0.06 * w_smooth
     final_half_w[0] = 0.0
     final_half_w[-1] = 0.0
 
-    # Construct left and right contour points at 4x supersampling
-    ys_idx = np.arange(y_min, y_max + 1, dtype=np.float64)
-    left_pts = np.column_stack([center_x - final_half_w, ys_idx])[::-1]
-    right_pts = np.column_stack([center_x + final_half_w, ys_idx])
+    # Evaluate at dense cosine-spaced sub-pixel y coordinates near the top tip (y_min) and
+    # bottom cuticle (y_max) so the horizontal tangent caps are rasterized with sub-pixel
+    # smoothness (avoiding a coarse 1-scanline jump from w ~ 12px to w = 0 at the poles).
+    theta_up = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
+    u_tip_dense = np.cos(theta_up)  # 1.0 at tip (y_min) -> 0.0 at equator (y_min + i_peak)
+    y_up_dense = float(y_min) + (1.0 - u_tip_dense) * float(i_peak)
+    w_up_analytic_dense = w_eq * (
+        np.clip(1.0 - (u_tip_dense ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up)
+    )
+    w_up_smooth_dense = np.interp(y_up_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
+    w_up_dense = 0.94 * w_up_analytic_dense + 0.06 * w_up_smooth_dense
+
+    theta_low = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
+    u_cut_dense = np.sin(theta_low)  # 0.0 at equator -> 1.0 at cuticle base (y_max)
+    y_low_dense = float(y_min + i_peak) + u_cut_dense * float(max(1, nail_h - 1 - i_peak))
+    w_low_analytic_dense = w_eq * (
+        np.clip(1.0 - (u_cut_dense ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low)
+    )
+    w_low_smooth_dense = np.interp(y_low_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
+    w_low_dense = 0.94 * w_low_analytic_dense + 0.06 * w_low_smooth_dense
+
+    ys_dense = np.concatenate([y_up_dense[:-1], y_low_dense])
+    half_w_dense = np.concatenate([w_up_dense[:-1], w_low_dense])
+    half_w_dense[0] = 0.0
+    half_w_dense[-1] = 0.0
+
+    # Rasterize contour at 4x supersampling
+    left_pts = np.column_stack([center_x - half_w_dense, ys_dense])[::-1]
+    right_pts = np.column_stack([center_x + half_w_dense, ys_dense])
     poly_pts = np.vstack([left_pts, right_pts])
 
     ss = 4
     mask_ss = np.zeros((h * ss, w * ss), dtype=np.uint8)
-    cv2.fillPoly(mask_ss, [(poly_pts * ss).astype(np.int32).reshape(-1, 1, 2)], 255)
+    cv2.fillPoly(mask_ss, [np.round(poly_pts * ss).astype(np.int32).reshape(-1, 1, 2)], 255)
     sym_mask = cv2.resize(mask_ss, (w, h), interpolation=cv2.INTER_AREA)
 
     if feather_px > 0:
@@ -104,8 +379,6 @@ def deskew_nail_pca(
     Computes the principal axis orientation of a nail contour using dense 2D central area moments
     (avoiding sparse convex-hull vertex clustering bias) and returns the deskew angle (in degrees),
     centered contour, and deskewed image.
-
-    Angle is normalized so that 0 degrees means the nail stands perfectly vertical.
     """
     pts = contour.reshape(-1, 2).astype(np.float64)
     if len(pts) < 5:
@@ -115,7 +388,6 @@ def deskew_nail_pca(
     if bw <= 2 or bh <= 2:
         return 0.0, contour, image
 
-    # Rasterize the filled contour polygon to compute exact 2D area moments (mu20, mu02, mu11)
     fill_img = np.zeros((bh + 8, bw + 8), dtype=np.uint8)
     shifted_pts = (pts - np.array([bx - 4, by - 4])).astype(np.int32)
     cv2.fillPoly(fill_img, [shifted_pts], 255)
@@ -125,11 +397,8 @@ def deskew_nail_pca(
         cx_local = M["m10"] / M["m00"]
         cy_local = M["m01"] / M["m00"]
         center = (cx_local + bx - 4.0, cy_local + by - 4.0)
-        # Angle of major principal axis from central moments
-        # Since nail is vertical (bh > bw), mu02 > mu20
         denom = M["mu02"] - M["mu20"]
         if abs(denom) > 1e-6:
-            # Deviation from vertical (90 deg) in radians
             tilt_rad = 0.5 * np.arctan2(2.0 * M["mu11"], denom)
             deskew_angle = float(np.degrees(tilt_rad))
         else:
@@ -138,7 +407,6 @@ def deskew_nail_pca(
         center = (float(bx + bw * 0.5), float(by + bh * 0.5))
         deskew_angle = 0.0
 
-    # Clamp within physically plausible tray mounting tolerance (+/- 8 deg)
     deskew_angle = float(np.clip(deskew_angle, -8.0, 8.0))
 
     rot_mat = cv2.getRotationMatrix2D(tuple(center), deskew_angle, 1.0)
@@ -236,8 +504,8 @@ def is_nail_inverted(contour: np.ndarray, patch_rgba: Optional[np.ndarray] = Non
 
 def classify_nail_shape(contour: np.ndarray, force_inverted: Optional[bool] = None) -> Dict[str, Any]:
     """
-    Classifies the isolated nail contour into Square, Coffin, Almond, Oval, or Stiletto
-    using geometric contour profiling on the free-edge tip region.
+    Classifies the isolated nail contour into Square, Squoval, Coffin, Almond, Oval, or Stiletto
+    using geometric contour profiling on the free-edge tip region and aspect ratio.
     """
     pts = contour.reshape(-1, 2)
     x, y, w, h = cv2.boundingRect(contour)
@@ -257,34 +525,49 @@ def classify_nail_shape(contour: np.ndarray, force_inverted: Optional[bool] = No
         tip_w = float(w * 0.5)
 
     flattening_ratio = float(tip_w / float(w))
+    aspect_ratio = float(h / float(w))
 
     perimeter = cv2.arcLength(contour, True)
     epsilon = 0.02 * perimeter
     approx = cv2.approxPolyDP(contour, epsilon, True)
+    vertex_count = int(len(approx))
 
     metrics = {
         "flattening_ratio": round(flattening_ratio, 3),
-        "aspect_ratio": round(float(h / w), 3),
-        "vertex_count": int(len(approx)),
+        "aspect_ratio": round(aspect_ratio, 3),
+        "vertex_count": vertex_count,
         "is_inverted": bool(inverted),
     }
 
-    if flattening_ratio > 0.76:
+    # Shape taxonomy:
+    # Stiletto: pointy tip (< 0.36)
+    # Almond: tapered convex tip (0.36 <= flattening < 0.54)
+    # Square: wide sharp flat tip (> 0.80)
+    # Squoval: flat-ish tip with rounded shoulders (0.58 <= flattening <= 0.80, aspect < 1.70 or rounded corners)
+    # Coffin: long tapered flat-tip (0.60 <= flattening <= 0.78, aspect >= 1.70)
+    # Oval: smooth curved tip (0.50 <= flattening < 0.60)
+    if flattening_ratio < 0.36:
+        shape = "Stiletto"
+        confidence = 0.90
+    elif flattening_ratio < 0.54:
+        shape = "Almond"
+        confidence = 0.89
+    elif flattening_ratio > 0.80:
         shape = "Square"
-        confidence = min(0.96, 0.70 + (flattening_ratio - 0.76) * 1.1)
-    elif 0.62 <= flattening_ratio <= 0.76:
-        shape = "Coffin"
-        confidence = 0.86
-    else:
-        if flattening_ratio < 0.36:
-            shape = "Stiletto"
-            confidence = 0.90
-        elif flattening_ratio < 0.54:
-            shape = "Almond"
-            confidence = 0.89
+        confidence = min(0.96, 0.70 + (flattening_ratio - 0.80) * 1.1)
+    elif 0.58 <= flattening_ratio <= 0.80:
+        if aspect_ratio >= 1.70 and vertex_count <= 7 and flattening_ratio <= 0.76:
+            shape = "Coffin"
+            confidence = 0.86
+        elif flattening_ratio >= 0.60:
+            shape = "Squoval"
+            confidence = 0.88
         else:
             shape = "Oval"
             confidence = 0.85
+    else:
+        shape = "Oval"
+        confidence = 0.85
 
     return {
         "shape": shape,
@@ -298,151 +581,267 @@ def segment_packaging_tray(
     max_slots: int = 15,
 ) -> List[Dict[str, Any]]:
     """
-    Detects press-on nail slots in a packaging tray image across both dark monochrome sets
-    and light/sheer/French-tip sets mounted on a white backing card.
+    Detects press-on nail slots in a packaging tray image across both dark monochrome sets,
+    sheer sets, white French tips, and tilted/angled camera poses.
+    
+    Rectifies perspective internally when tilted (> 1.5 deg) or foreshortened (> 3%),
+    performs multi-cue foreground segmentation in the fronto-parallel plane, cuts row
+    valleys to prevent row merging, and maps all contour coordinates and bboxes back to
+    ORIGINAL image coordinates via H_inv.
     """
-    h_img, w_img = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    sat = hsv[:, :, 1]
-    lab_A = lab[:, :, 1]
+    # Step 1: Perspective rectification
+    rect_img, H, card_quad = rectify_backing_card(image)
+    h_img, w_img = rect_img.shape[:2]
 
-    raw_nails = []
+    gray: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2GRAY)
+    hsv: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2HSV)
+    lab: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2LAB)
+    sat: np.ndarray = hsv[:, :, 1]
+    lab_L: np.ndarray = lab[:, :, 0]
+    lab_A: np.ndarray = lab[:, :, 1]
 
-    # 1. Universal White Backing Card Detection
-    card_bin = ((gray > 180) & (sat < 30)).astype(np.uint8) * 255
-    card_cnts, _ = cv2.findContours(card_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(card_cnts) > 0:
-        card_c = max(card_cnts, key=cv2.contourArea)
-        cx, cy, cw, ch = cv2.boundingRect(card_c)
-        if cw > w_img * 0.35 and ch > h_img * 0.35:
+    # Card ROI in rectified image
+    if card_quad is not None:
+        rx0, ry0 = 0, 0
+        rw, rh = w_img, h_img
+    else:
+        card_bin = ((gray > 165) & (sat < 40)).astype(np.uint8) * 255
+        k_close = max(5, int(min(w_img, h_img) * 0.008) | 1)
+        card_closed = cv2.morphologyEx(
+            card_bin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
+        )
+        cnts, _ = cv2.findContours(card_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_cnts = [c for c in cnts if cv2.contourArea(c) > w_img * h_img * 0.15]
+        candidates = []
+        for c in valid_cnts:
+            M = cv2.moments(c)
+            cy = M["m01"] / M["m00"] if M["m00"] > 0 else h_img / 2.0
+            score = cv2.contourArea(c)
+            if cy / float(h_img) < 0.35:
+                score *= 0.1
+            candidates.append((score, c))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            card_c = candidates[0][1]
+            cx, cy, cw, ch = cv2.boundingRect(card_c)
             mx, my = int(cw * 0.04), int(ch * 0.04)
             rx0, ry0 = cx + mx, cy + my
             rw, rh = cw - 2 * mx, ch - 2 * my
-            roi_gray = gray[ry0:ry0 + rh, rx0:rx0 + rw]
-            roi_sat = sat[ry0:ry0 + rh, rx0:rx0 + rw]
-            roi_A = lab_A[ry0:ry0 + rh, rx0:rx0 + rw]
-            bg_gray = float(np.percentile(roi_gray, 82))
+        else:
+            rx0, ry0 = int(w_img * 0.05), int(h_img * 0.05)
+            rw, rh = int(w_img * 0.90), int(h_img * 0.90)
 
-            # Detect nail pixels:
-            # Either warm/colored pigment (LAB A >= 131 or sat >= 18) OR jet-black French tip (gray < 88).
-            # This completely rejects both neutral clear plastic carrier tabs AND medium-grey card shadows!
-            fg = (
-                (((roi_A >= 131) | (roi_sat >= 18)) & (roi_gray < bg_gray - 5))
-                | (roi_gray < 88)
-            ).astype(np.uint8) * 255
+    roi_gray = gray[ry0:ry0 + rh, rx0:rx0 + rw]
+    roi_sat = sat[ry0:ry0 + rh, rx0:rx0 + rw]
+    roi_A = lab_A[ry0:ry0 + rh, rx0:rx0 + rw]
+    roi_L = lab_L[ry0:ry0 + rh, rx0:rx0 + rw]
 
-            # Remove all thin text strokes ("Nail BERRIE" logo & footer text) using morphological opening
-            # before component filtering, since text strokes are thin (< 9px) while nails are solid (> 45px wide)!
-            k_open_text = max(5, int(min(rw, rh) * 0.016) | 1)
-            fg = cv2.morphologyEx(
-                fg,
-                cv2.MORPH_OPEN,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open_text, k_open_text)),
-            )
+    bg_gray = float(np.percentile(roi_gray, 82))
+    bg_sat = float(np.percentile(roi_sat, 50))
+    bg_A = float(np.percentile(roi_A, 50))
+    sat_thresh = max(18.0, bg_sat + 16.0)
+    A_thresh = max(132.0, bg_A + 2.5)
 
-            # Filter out any remaining small non-nail blobs (height < 14% of card height or solidity < 0.65)
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg)
-            for lbl in range(1, num_labels):
-                bh_lbl = stats[lbl, cv2.CC_STAT_HEIGHT]
-                bw_lbl = stats[lbl, cv2.CC_STAT_WIDTH]
-                area_lbl = stats[lbl, cv2.CC_STAT_AREA]
-                if (
-                    bh_lbl < rh * 0.13
-                    or area_lbl < (rw * rh * 0.005)
-                    or (bw_lbl < rw * 0.25 and area_lbl / max(1.0, float(bw_lbl * bh_lbl)) < 0.52)
-                ):
-                    fg[labels == lbl] = 0
+    # Step 2.1: Multi-cue foreground detection
+    # 1. Chrominance cue (warm pigment, peach, pink, terracotta, gold)
+    cue_chroma = ((roi_A >= A_thresh) | (roi_sat >= sat_thresh)) & (roi_gray < bg_gray - 5)
+    # 2. Dark pigment cue (jet-black French tips, cat-eye crimson, dark art)
+    # Rejects light-grey achromatic cast shadows on the white backing card (gray > 108 with neutral chroma)
+    cue_dark = (roi_gray < 108) | (
+        (roi_gray < bg_gray - 28.0) & ((roi_sat >= bg_sat + 10.0) | (roi_A >= bg_A + 2.0))
+    )
+    # Suppress dark cue in the header logo zone where "Nail BERRIE" is printed
+    logo_mask = np.zeros((rh, rw), dtype=bool)
+    logo_mask[:int(rh * 0.165), int(rw * 0.22):int(rw * 0.78)] = True
+    cue_dark = cue_dark & (~logo_mask)
+    # 3. White French tip rim edge gradient and rim shadow (33.jpg):
+    gx_L = cv2.Scharr(roi_L, cv2.CV_32F, 1, 0)
+    gy_L = cv2.Scharr(roi_L, cv2.CV_32F, 0, 1)
+    mag_L = np.sqrt(gx_L**2 + gy_L**2)
 
-            fg_closed = cv2.morphologyEx(
-                fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            )
-            rcnts, _ = cv2.findContours(fg_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            rows = []
-            for c in rcnts:
-                x, y, bw, bh = cv2.boundingRect(c)
-                if bw > rw * 0.35 and bh > rh * 0.12 and (bw / float(bh)) > 1.4:
-                    rows.append((y, x, bw, bh))
-            rows.sort(key=lambda r: r[0])
+    k_bg = max(15, int(min(rw, rh) * 0.04) | 1)
+    local_bg = cv2.boxFilter(roi_gray, cv2.CV_32F, (k_bg, k_bg))
+    rim_shadow = (roi_gray.astype(np.float32) < local_bg - 6.0)
 
-            for ry, rx, rbw, rbh in rows:
-                row_fg = fg[ry:ry + rbh, rx:rx + rbw].copy()
-                # Remove any tiny stray fragments at the top/bottom of row_fg before closing
-                n_rl, r_labels, r_stats, _ = cv2.connectedComponentsWithStats(row_fg)
-                for r_lbl in range(1, n_rl):
-                    if r_stats[r_lbl, cv2.CC_STAT_HEIGHT] < rbh * 0.45:
-                        row_fg[r_labels == r_lbl] = 0
+    pink_base = ((roi_A >= A_thresh) | (roi_sat >= sat_thresh)) & (roi_gray < bg_gray - 5)
+    k_down = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(rh * 0.08))))
+    pink_col_span = cv2.dilate(pink_base.astype(np.uint8), k_down)
 
-                # Close internal specular highlights without bridging across external gaps
-                row_fg = cv2.morphologyEx(
-                    row_fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 9))
-                )
-                col_h = np.sum(row_fg > 0, axis=0).astype(np.float32)
-                col_smooth = cv2.GaussianBlur(col_h.reshape(-1, 1), (1, 17), 4.0).ravel()
+    cue_white_tip = (mag_L > np.percentile(mag_L, 88)) & rim_shadow & (pink_col_span > 0)
 
-                min_dist = int(rbw * 0.13)
-                valleys, props = find_peaks(-col_smooth, distance=min_dist, prominence=rbh * 0.05)
-                valid_valleys = [
-                    (v, p)
-                    for v, p in zip(valleys, props["prominences"])
-                    if int(rbw * 0.14) < v < int(rbw * 0.91)
-                ]
-                valid_valleys.sort(key=lambda item: item[1], reverse=True)
-                chosen_valleys = sorted([v for v, _ in valid_valleys[:4]])
+    fg_raw = (cue_chroma | cue_dark | cue_white_tip).astype(np.uint8) * 255
 
-                for v in chosen_valleys:
-                    row_fg[:, max(0, v - 1):min(rbw, v + 2)] = 0
+    # Remove thin text strokes ("Nail BERRIE" logo and footer text)
+    k_open_text = max(5, int(min(rw, rh) * 0.016) | 1)
+    fg_opened = cv2.morphologyEx(
+        fg_raw,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open_text, k_open_text)),
+    )
 
-                ncnts, _ = cv2.findContours(row_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                row_nails = []
-                for nc in ncnts:
-                    nx, ny, nbw, nbh = cv2.boundingRect(nc)
-                    if nbw > rbw * 0.08 and nbh > rbh * 0.55:
-                        hull_local = cv2.convexHull(nc)
-                        gx = rx0 + rx + nx
-                        gy = ry0 + ry + ny
-                        hull_global = hull_local + np.array([rx0 + rx, ry0 + ry])
-                        hull_area = float(cv2.contourArea(hull_global))
-                        row_nails.append({
-                            "gx": gx,
-                            "gy": gy,
-                            "bw": nbw,
-                            "bh": nbh,
-                            "area": hull_area,
-                            "aspect": nbh / float(nbw) if nbw > 0 else 1.5,
-                            "contour": hull_global,
-                        })
+    # Step 2.1b: Row valley detection via horizontal projection (y-profile)
+    row_h = np.sum(fg_opened > 0, axis=1).astype(np.float32)
+    k_smooth = max(21, int(rh * 0.02) | 1)
+    row_smooth = cv2.GaussianBlur(row_h.reshape(-1, 1), (1, k_smooth), k_smooth / 4.0).ravel()
 
-                row_nails.sort(key=lambda n: n["gx"])
-                if len(row_nails) >= 2:
-                    gy_tops = [n["gy"] for n in row_nails]
-                    gy_bots = [n["gy"] + n["bh"] for n in row_nails]
-                    thumb_inv = is_nail_inverted(row_nails[0]["contour"])
-                    row_inverted = thumb_inv or (np.std(gy_bots) > np.std(gy_tops) * 1.15)
-                else:
-                    row_inverted = True
+    min_dist_row = int(rh * 0.20)
+    valleys, props = scipy.signal.find_peaks(-row_smooth, distance=min_dist_row, prominence=rw * 0.02)
+    valid_valleys = [
+        (v, p) for v, p in zip(valleys, props["prominences"])
+        if int(rh * 0.24) < v < int(rh * 0.85)
+    ]
+    valid_valleys.sort(key=lambda item: item[1], reverse=True)
+    chosen_valleys = sorted([v for v, _ in valid_valleys[:2]])
 
-                for n in row_nails:
-                    n["row_inverted"] = bool(row_inverted)
+    # Cut fg at row valleys to prevent rows from merging vertically
+    fg_cut = fg_opened.copy()
+    cut_half = max(2, int(rh * 0.005))
+    for v in chosen_valleys:
+        fg_cut[max(0, v - cut_half):min(rh, v + cut_half + 1), :] = 0
 
-                raw_nails.extend(row_nails)
+    fg_closed = cv2.morphologyEx(
+        fg_cut, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    )
+    rcnts, _ = cv2.findContours(fg_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rows: List[Tuple[int, int, int, int]] = []
+    for c in rcnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw > rw * 0.35 and bh > rh * 0.10:
+            rows.append((y, x, bw, bh))
+    rows.sort(key=lambda r: r[0])
 
-    results = []
+    raw_nails = []
+    for ry, rx, rbw, rbh in rows:
+        row_fg = fg_cut[ry:ry + rbh, rx:rx + rbw].copy()
+        n_rl, r_labels, r_stats, _ = cv2.connectedComponentsWithStats(row_fg)
+        for r_lbl in range(1, n_rl):
+            if r_stats[r_lbl, cv2.CC_STAT_HEIGHT] < rbh * 0.35:
+                row_fg[r_labels == r_lbl] = 0
+
+        row_fg = cv2.morphologyEx(
+            row_fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 9))
+        )
+        col_h = np.sum(row_fg > 0, axis=0).astype(np.float32)
+        col_smooth = cv2.GaussianBlur(col_h.reshape(-1, 1), (1, 17), 4.0).ravel()
+
+        min_dist_col = max(10, int(rbw * 0.08))
+        c_valleys, props = scipy.signal.find_peaks(-col_smooth, distance=min_dist_col, prominence=rbh * 0.02)
+        valid_c_valleys = [
+            (v, p) for v, p in zip(c_valleys, props["prominences"])
+            if int(rbw * 0.08) < v < int(rbw * 0.94)
+        ]
+        valid_c_valleys.sort(key=lambda item: item[1], reverse=True)
+        chosen_c_valleys = sorted([v for v, _ in valid_c_valleys[:4]])
+
+        for v in chosen_c_valleys:
+            row_fg[:, max(0, v - 1):min(rbw, v + 2)] = 0
+
+        ncnts, _ = cv2.findContours(row_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        row_nails = []
+        for nc in ncnts:
+            nx, ny, nbw, nbh = cv2.boundingRect(nc)
+            if nbw > rbw * 0.05 and nbh > rbh * 0.35:
+                hull_local = cv2.convexHull(nc)
+                gx = rx0 + rx + nx
+                gy = ry0 + ry + ny
+                hull_rect = hull_local + np.array([rx0 + rx, ry0 + ry])
+                hull_area = float(cv2.contourArea(hull_rect))
+                row_nails.append({
+                    "gx": gx,
+                    "gy": gy,
+                    "bw": nbw,
+                    "bh": nbh,
+                    "area": hull_area,
+                    "aspect": nbh / float(nbw) if nbw > 0 else 1.5,
+                    "contour_rect": hull_rect,
+                })
+
+        row_nails.sort(key=lambda n: n["gx"])
+        if len(row_nails) >= 2:
+            gy_tops = [n["gy"] for n in row_nails]
+            gy_bots = [n["gy"] + n["bh"] for n in row_nails]
+            thumb_inv = is_nail_inverted(row_nails[0]["contour_rect"])
+            row_inverted = thumb_inv or (np.std(gy_bots) > np.std(gy_tops) * 1.15)
+        else:
+            row_inverted = True
+
+        for n in row_nails:
+            n["row_inverted"] = bool(row_inverted)
+
+        raw_nails.extend(row_nails)
+
+    # Step 2.1c: Map coordinates back to ORIGINAL image plane via H_inv
+    H_inv = np.linalg.inv(H)
+    is_identity = np.allclose(H, np.eye(3))
+
+    results: List[Dict[str, Any]] = []
     for idx, item in enumerate(raw_nails[:max_slots], start=1):
-        cnt = item["contour"]
-        pca_angle, rotated_cnt, _ = deskew_nail_pca(cnt)
+        cnt_rect = item["contour_rect"]
         force_inv = item.get("row_inverted", None)
+
+        # Refine slot contour in rect_img against directional flash cast shadows
+        sx, sy, sbw, sbh = cv2.boundingRect(cnt_rect)
+        spad = 8
+        sx0 = max(0, sx - spad)
+        sy0 = max(0, sy - spad)
+        sx1 = min(w_img, sx + sbw + spad)
+        sy1 = min(h_img, sy + sbh + spad)
+        sp_gray = gray[sy0:sy1, sx0:sx1]
+        sp_sat = sat[sy0:sy1, sx0:sx1]
+        sp_A = lab_A[sy0:sy1, sx0:sx1]
+        sp_hull = np.zeros_like(sp_gray, dtype=np.uint8)
+        cv2.fillPoly(sp_hull, [cnt_rect.reshape(-1, 2) - np.array([sx0, sy0])], 255)
+        sp_ek = max(5, int(min(sbw, sbh) * 0.22) | 1)
+        sp_core = cv2.erode(sp_hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sp_ek, sp_ek))) > 0
+        if np.sum(sp_core) >= 20:
+            c_gray_m = float(np.percentile(sp_gray[sp_core], 50))
+            c_sat_p75 = float(np.percentile(sp_sat[sp_core], 75))
+            c_A_p75 = float(np.percentile(sp_A[sp_core], 75))
+            if c_gray_m < 115.0 and c_sat_p75 > 65.0:
+                eff_s = max(sat_thresh, bg_sat + 0.72 * (c_sat_p75 - bg_sat))
+                eff_a = max(A_thresh, bg_A + 0.72 * (c_A_p75 - bg_A))
+                sp_fg = ((sp_A >= eff_a) | (sp_sat >= eff_s)) & (sp_gray < bg_gray - 12)
+                sp_fg_u8 = cv2.bitwise_and(sp_fg.astype(np.uint8) * 255, sp_hull)
+                sp_fg_u8 = cv2.morphologyEx(
+                    sp_fg_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                )
+                sp_fg_u8 = cv2.morphologyEx(
+                    sp_fg_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                )
+                sp_cnts, _ = cv2.findContours(sp_fg_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if sp_cnts:
+                    best_sp = max(sp_cnts, key=cv2.contourArea)
+                    if cv2.contourArea(best_sp) > 0.40 * float(sbw * sbh):
+                        cnt_rect = cv2.convexHull(best_sp) + np.array([[[sx0, sy0]]])
+                        rx_n, ry_n, rbw_n, rbh_n = cv2.boundingRect(cnt_rect)
+                        item["gx"], item["gy"], item["bw"], item["bh"] = rx_n, ry_n, rbw_n, rbh_n
+                        item["area"] = float(cv2.contourArea(cnt_rect))
+                        item["aspect"] = rbh_n / float(rbw_n) if rbw_n > 0 else 1.5
+
+        pca_angle, rotated_cnt, _ = deskew_nail_pca(cnt_rect)
         shape_info = classify_nail_shape(rotated_cnt, force_inverted=force_inv)
 
+        if not is_identity:
+            pts_rect = cnt_rect.reshape(-1, 2).astype(np.float64)
+            pts_orig = cv2.perspectiveTransform(pts_rect.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
+            cnt_final = pts_orig.astype(np.int32)
+            bx, by, bw, bh = cv2.boundingRect(cnt_final)
+            area_final = float(cv2.contourArea(cnt_final))
+        else:
+            cnt_final = cnt_rect.reshape(-1, 2).astype(np.int32)
+            bx, by, bw, bh = int(item["gx"]), int(item["gy"]), int(item["bw"]), int(item["bh"])
+            area_final = float(item["area"])
+
         results.append({
-            "slot_id": idx,
-            "bbox": [int(item["gx"]), int(item["gy"]), int(item["bw"]), int(item["bh"])],
-            "contour": cnt.reshape(-1, 2).tolist(),
-            "area": float(item["area"]),
+            "slot_id": int(idx),
+            "bbox": [int(bx), int(by), int(bw), int(bh)],
+            "contour": cnt_final.reshape(-1, 2).tolist(),
+            "area": float(area_final),
             "aspect_ratio": round(float(item["aspect"]), 2),
             "pca_angle": round(float(pca_angle), 2),
             "shape_info": shape_info,
+            "homography": H.tolist(),
+            "card_quad": card_quad.tolist() if card_quad is not None else None,
         })
 
     return results
@@ -455,55 +854,134 @@ def extract_nail_rgba(
     deskew: bool = True,
     auto_orient_cuticle_down: bool = True,
     force_inverted: Optional[bool] = None,
+    homography: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Extracts an isolated, 100% solid, B-spline curve-smoothed RGBA nail cutout
-    from the source tray image. Supports both dark solid sets and light/sheer/French-tip sets.
+    from the source tray image.
+    
+    When homography is provided (from perspective rectification), warps the image
+    into the rectified fronto-parallel plane at full source resolution and extracts
+    the nail there, ensuring true aspect ratio and zero distortion.
+    
+    Uses data-driven bilateral profile smoothing with monotonic envelopes and
+    applies a minimal 2px-3px edge-fringe cleanup so zero white card background
+    leaks into anti-aliased edges, keeping interior RGB 100% byte-identical.
     """
-    pts = np.array(contour, dtype=np.int32).reshape(-1, 2)
-    x, y, w, h = cv2.boundingRect(pts)
+    pts = np.array(contour, dtype=np.float64).reshape(-1, 2)
+
+    # If homography is provided and not identity, warp to rectified plane
+    if homography is not None and not np.allclose(homography, np.eye(3)):
+        h_src, w_src = image.shape[:2]
+        corners = np.array(
+            [[0.0, 0.0], [float(w_src), 0.0], [float(w_src), float(h_src)], [0.0, float(h_src)]],
+            dtype=np.float64,
+        ).reshape(-1, 1, 2)
+        c_rect = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+        dst_w = max(int(np.ceil(np.max(c_rect[:, 0]))), 1)
+        dst_h = max(int(np.ceil(np.max(c_rect[:, 1]))), 1)
+        warped_img = cv2.warpPerspective(
+            image, homography, (dst_w, dst_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+        )
+        pts_rect = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), homography).reshape(-1, 2)
+        working_img = warped_img
+        working_pts = pts_rect.astype(np.int32)
+    else:
+        working_img = image
+        working_pts = pts.astype(np.int32)
+
+    x, y, w, h = cv2.boundingRect(working_pts)
     if w <= 0 or h <= 0:
         return np.zeros((10, 10, 4), dtype=np.uint8)
 
     pad = int(max(w, h) * 0.35) + 12
     x0 = max(0, x - pad)
     y0 = max(0, y - pad)
-    x1 = min(image.shape[1], x + w + pad)
-    y1 = min(image.shape[0], y + h + pad)
+    x1 = min(working_img.shape[1], x + w + pad)
+    y1 = min(working_img.shape[0], y + h + pad)
 
-    patch_bgr = image[y0:y1, x0:x1].copy()
+    patch_bgr = working_img[y0:y1, x0:x1].copy()
     ph, pw = patch_bgr.shape[:2]
-    local_pts = pts - np.array([x0, y0])
+    local_pts = working_pts - np.array([x0, y0])
 
     hull = cv2.convexHull(local_pts)
     hull_mask = np.zeros((ph, pw), dtype=np.uint8)
     cv2.fillPoly(hull_mask, [hull], 255)
+    hull_mask = cv2.dilate(hull_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
 
     patch_gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
     patch_hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
     patch_lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB)
     patch_sat = patch_hsv[:, :, 1]
     patch_A = patch_lab[:, :, 1]
+    patch_B = patch_lab[:, :, 2]
+    patch_L = patch_lab[:, :, 0]
 
-    ext_card_pixels = patch_gray[(hull_mask == 0) & (patch_sat < 25) & (patch_gray > 175)]
-    if len(ext_card_pixels) > 20:
-        bg_gray = float(np.percentile(ext_card_pixels, 75))
+    ext_card_pixels = (hull_mask == 0) & (patch_sat < 40) & (patch_gray > 165)
+    if np.sum(ext_card_pixels) > 20:
+        bg_gray = float(np.percentile(patch_gray[ext_card_pixels], 75))
+        bg_sat = float(np.percentile(patch_sat[ext_card_pixels], 50))
+        bg_A = float(np.percentile(patch_A[ext_card_pixels], 50))
     else:
         bg_gray = max(210.0, float(np.percentile(patch_gray, 85)))
+        bg_sat = 10.0
+        bg_A = 128.0
 
-    # Universal nail foreground mask inside hull_mask (excludes clear plastic tabs and grey card shadows)
-    fg_raw = np.where(
-        (((patch_A >= 131) | (patch_sat >= 18)) & (patch_gray < bg_gray - 5))
-        | (patch_gray < 88),
-        255,
-        0,
-    ).astype(np.uint8)
+    sat_thresh = max(18.0, bg_sat + 16.0)
+    A_thresh = max(132.0, bg_A + 2.5)
+
+    # Measure core nail properties inside the central region of hull_mask
+    # When the nail is a dark, richly pigmented nail (e.g. burgundy/espresso with core_gray < 110
+    # and core_sat > 60), tighten chroma & dark thresholds relative to the nail core so directional
+    # flash cast shadows on the white backing card (gray ~ 80-150, sat ~ 40-65) are 100% rejected.
+    core_erode_k = max(5, int(min(w, h) * 0.22) | 1)
+    core_region = cv2.erode(
+        hull_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_erode_k, core_erode_k))
+    ) > 0
+    if np.sum(core_region) < 25:
+        core_region = hull_mask > 0
+
+    core_gray_med = float(np.percentile(patch_gray[core_region], 50))
+    core_sat_p75 = float(np.percentile(patch_sat[core_region], 75))
+    core_A_p75 = float(np.percentile(patch_A[core_region], 75))
+
+    if core_gray_med < 115.0 and core_sat_p75 > 65.0:
+        eff_sat_thresh = max(sat_thresh, bg_sat + 0.72 * (core_sat_p75 - bg_sat))
+        eff_A_thresh = max(A_thresh, bg_A + 0.72 * (core_A_p75 - bg_A))
+        cue_chroma = ((patch_A >= eff_A_thresh) | (patch_sat >= eff_sat_thresh)) & (patch_gray < bg_gray - 12)
+        cue_dark = np.zeros_like(cue_chroma, dtype=bool)
+    else:
+        cue_chroma = ((patch_A >= A_thresh) | (patch_sat >= sat_thresh)) & (patch_gray < bg_gray - 5)
+        is_dark_nail = np.percentile(patch_gray[core_region], 25) < 95.0
+        if is_dark_nail:
+            cue_dark = (patch_gray < 88) | (
+                (patch_gray < bg_gray - 28.0) & ((patch_sat >= bg_sat + 10.0) | (patch_A >= bg_A + 2.0))
+            )
+        else:
+            cue_dark = np.zeros_like(cue_chroma, dtype=bool)
+
+    # Edge gradient and rim shadow for white French tips
+    gx_L = cv2.Scharr(patch_L, cv2.CV_32F, 1, 0)
+    gy_L = cv2.Scharr(patch_L, cv2.CV_32F, 0, 1)
+    mag_L = np.sqrt(gx_L**2 + gy_L**2)
+
+    k_bg = max(9, int(min(pw, ph) * 0.05) | 1)
+    local_bg = cv2.boxFilter(patch_gray, cv2.CV_32F, (k_bg, k_bg))
+    rim_shadow = patch_gray.astype(np.float32) < local_bg - 6.0
+
+    pink_base = ((patch_A >= A_thresh) | (patch_sat >= sat_thresh)) & (patch_gray < bg_gray - 5)
+    k_down = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(ph * 0.08))))
+    pink_col_span = cv2.dilate(pink_base.astype(np.uint8), k_down)
+
+    cue_edge = (mag_L > np.percentile(mag_L, 88)) & rim_shadow & (pink_col_span > 0)
+
+    fg_raw = np.where((cue_chroma | cue_dark | cue_edge), 255, 0).astype(np.uint8)
     fg_masked = cv2.bitwise_and(fg_raw, hull_mask)
 
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     fg_cleaned = cv2.morphologyEx(fg_masked, cv2.MORPH_OPEN, open_k, iterations=1)
-    fg_closed = cv2.morphologyEx(fg_cleaned, cv2.MORPH_CLOSE, close_k, iterations=2)
+    fg_closed = cv2.morphologyEx(fg_cleaned, cv2.MORPH_CLOSE, close_k, iterations=1)
 
     ext_cnts, _ = cv2.findContours(fg_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     solid_mask = np.zeros((ph, pw), dtype=np.uint8)
@@ -519,11 +997,6 @@ def extract_nail_rgba(
     erode_iters = 2 if w >= 100 else 1
     erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     solid_mask = cv2.erode(solid_mask, erode_kernel, iterations=erode_iters)
-
-    inner_bgr = cv2.erode(patch_bgr, erode_kernel, iterations=erode_iters + 1)
-    edge_ring = (solid_mask > 0) & (cv2.erode(solid_mask, erode_kernel, iterations=erode_iters) == 0)
-    patch_bgr[edge_ring] = inner_bgr[edge_ring]
-    patch_bgr[solid_mask == 0] = 0
 
     b, g, r = cv2.split(patch_bgr)
     patch_rgba = cv2.merge([b, g, r, solid_mask])
@@ -548,36 +1021,20 @@ def extract_nail_rgba(
     if auto_orient_cuticle_down and should_invert:
         patch_rgba = cv2.rotate(patch_rgba, cv2.ROTATE_180)
 
+    # Step 2.2: Data-driven symmetric smooth mask (no forced almond template)
     sym_alpha = build_symmetric_smooth_nail_mask(patch_rgba[:, :, 3], feather_px=feather_px)
 
-    core_mask = (patch_rgba[:, :, 3] > 225).astype(np.uint8)
-    k_erode = max(3, int(min(patch_rgba.shape[0], patch_rgba.shape[1]) * 0.06) | 1)
-    erode_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_erode, k_erode))
-    core_mask = cv2.erode(core_mask, erode_c, iterations=1)
-    if np.any(core_mask > 0):
-        rgb_clean = patch_rgba[:, :, :3].copy()
-        rgb_smooth = cv2.GaussianBlur(rgb_clean, (5, 5), 1.2)
-        ch, cw = core_mask.shape
-        for row_y in range(ch):
-            valid_xs = np.where(core_mask[row_y, :] > 0)[0]
-            if len(valid_xs) >= 4:
-                x_left = int(valid_xs[1])
-                x_right = int(valid_xs[-2])
-                rgb_clean[row_y, :int(valid_xs[0])] = rgb_smooth[row_y, x_left]
-                rgb_clean[row_y, int(valid_xs[-1]) + 1:] = rgb_smooth[row_y, x_right]
-            elif len(valid_xs) >= 1:
-                x_left = int(valid_xs[0])
-                x_right = int(valid_xs[-1])
-                rgb_clean[row_y, :x_left] = rgb_smooth[row_y, x_left]
-                rgb_clean[row_y, x_right + 1:] = rgb_smooth[row_y, x_right]
-        valid_ys = np.where(np.any(core_mask > 0, axis=1))[0]
-        if len(valid_ys) >= 6:
-            # Sample 4 rows inside the top/bottom core so any 1px rim specular at the very tip edge is skipped
-            y_top = int(valid_ys[min(len(valid_ys) - 1, 4)])
-            y_bot = int(valid_ys[max(0, len(valid_ys) - 5)])
-            rgb_clean[:int(valid_ys[2]), :] = rgb_smooth[y_top, :]
-            rgb_clean[int(valid_ys[-3]) + 1:, :] = rgb_smooth[y_bot, :]
-        patch_rgba[:, :, :3] = rgb_clean
-    patch_rgba[:, :, 3] = sym_alpha
+    # Step Extra A: Minimal edge-fringe cleanup with zero interior pixel fabrication
+    # Inpaint only the outer boundary ring (where sym_alpha > 0 but outside eroded core)
+    # Interior core pixels remain 100% byte-identical to source photo.
+    core_mask = (patch_rgba[:, :, 3] > 200).astype(np.uint8)
+    erode_fringe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    core_eroded = cv2.erode(core_mask, erode_fringe, iterations=2)
+    if np.any(core_eroded > 0):
+        fringe_ring = ((sym_alpha > 0) & (core_eroded == 0)).astype(np.uint8) * 255
+        if np.any(fringe_ring > 0):
+            inpainted_rgb = cv2.inpaint(patch_rgba[:, :, :3], fringe_ring, inpaintRadius=3.0, flags=cv2.INPAINT_TELEA)
+            patch_rgba[:, :, :3][fringe_ring > 0] = inpainted_rgb[fringe_ring > 0]
 
+    patch_rgba[:, :, 3] = sym_alpha
     return patch_rgba

@@ -19,59 +19,75 @@ def apply_cylindrical_c_curve(
     roll_offset: float = 0.0,
 ) -> np.ndarray:
     """
-    Applies transverse non-linear barrel compression across the nail's width
+    Applies transverse non-linear barrel foreshortening across the nail's interior width
     to simulate 3D curvature wrapping around the cylindrical nail plate, plus
     3D lateral yaw/roll perspective foreshortening when roll_offset != 0
     (e.g. for a thumb viewed in 3/4 side profile).
 
-    Parameters:
-      image: Source image (BGR or BGRA).
-      c_curve_intensity: Float in [0.0, 1.0], controls depth of curvature.
-      roll_offset: Float in [-0.6, 0.6], 3D lateral yaw rotation angle around the
-                   longitudinal nail spine:
-                   - Negative roll_offset (e.g. -0.35 for a left-hand thumb):
-                     the nail is turned toward the left (free profile edge on left,
-                     attached nail-bed sidewall on right).
-                   - Positive roll_offset: turned toward the right.
+    Crucially, for frontal nails (roll_offset == 0), the cylindrical mapping is normalized
+    per-scanline across each row's active nail span [x_left(y), x_right(y)]. Because
+    arcsin(u * sin(max_angle)) / max_angle maps -1 -> -1 and +1 -> +1 at the scanline
+    boundaries, the outer 2D silhouette of the nail remains 100% invariant (zero capsule
+    bloating of tapered almond/oval sidewalls), while interior nail art curves in 3D.
     """
     h, w = image.shape[:2]
     if w < 4 or h < 4 or (c_curve_intensity <= 0.01 and abs(roll_offset) <= 0.01):
         return image.copy()
 
-    # Normalized destination x coordinates across width: -1.0 to 1.0
-    x_dst = np.linspace(-1.0, 1.0, w)
-
-    # 1. Non-linear power-law lateral perspective foreshortening for 3D thumb roll:
-    #    Maps [-1, 1] -> [-1, 1] monotonically so neither edge is ever clipped, while
-    #    compressing the foreshortened outer profile side and expanding the visible nail plate.
-    if abs(roll_offset) > 0.01:
-        u_01 = (x_dst + 1.0) * 0.5  # [0, 1]
-        gamma = float(np.power(2.0, -roll_offset * 1.6))
-        u_skewed = np.power(np.clip(u_01, 0.0, 1.0), gamma)
-        x_rolled = u_skewed * 2.0 - 1.0
-    else:
-        x_rolled = x_dst
-
-    x_clamped = np.clip(x_rolled, -0.999, 0.999)
-
-    # 2. Physical cylinder projection angle
     max_angle = (np.pi / 2.0) * min(0.95, max(0.05, c_curve_intensity))
-    phi = np.arcsin(x_clamped * np.sin(max_angle))
-    u_tex = phi / max_angle  # normalized texture coordinate in [-1, 1]
+    sin_max = float(np.sin(max_angle))
 
-    # Map back to source pixel coordinates [0, w-1]
-    src_x = (u_tex + 1.0) * 0.5 * (w - 1)
+    # Per-scanline silhouette-preserving cylindrical C-curve mapping
+    x_grid = np.arange(w, dtype=np.float32)[None, :]
+    map_x = np.tile(x_grid, (h, 1))
+    map_y = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
 
-    map_x = np.tile(src_x, (h, 1)).astype(np.float32)
-    map_y = np.tile(np.arange(h)[:, None], (1, w)).astype(np.float32)
+    has_alpha = image.shape[2] == 4
+    if has_alpha:
+        alpha = image[:, :, 3]
+        centers = np.full(h, (w - 1) * 0.5, dtype=np.float32)
+        radii = np.full(h, (w - 1) * 0.5, dtype=np.float32)
+        valid_rows = np.zeros(h, dtype=bool)
+        for y in range(h):
+            xs = np.where(alpha[y] > 12)[0]
+            if len(xs) >= 2:
+                x0 = float(xs[0])
+                x1 = float(xs[-1])
+                centers[y] = 0.5 * (x0 + x1)
+                radii[y] = max(2.0, 0.5 * (x1 - x0))
+                valid_rows[y] = True
+
+        if np.any(valid_rows):
+            # Smooth centers and radii vertically so interior UV lines remain C2 smooth
+            centers = cv2.GaussianBlur(centers.reshape(-1, 1), (1, 15), 3.0).ravel()
+            radii = cv2.GaussianBlur(radii.reshape(-1, 1), (1, 15), 3.0).ravel()
+
+            u = (x_grid - centers[:, None]) / radii[:, None]
+            inside = np.abs(u) < 1.0
+            u_clamped = np.clip(u, -0.9999, 0.9999)
+            u_tex = np.arcsin(u_clamped * sin_max) / max_angle
+            map_x = np.where(inside, centers[:, None] + u_tex * radii[:, None], x_grid)
+
+    # Global 3D lateral yaw/roll perspective foreshortening for 3/4 profile thumb
+    if abs(roll_offset) > 0.01:
+        x_norm = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :]
+        gamma = float(np.power(2.0, -roll_offset * 1.35))
+        x_rolled = np.power(np.clip(x_norm, 0.0, 1.0), gamma) * (w - 1)
+        # Re-interpolate map_x through the lateral roll curve
+        map_x = np.clip(x_rolled, 0.0, float(w - 1))
+        if c_curve_intensity > 0.01:
+            u_r = (map_x / float(w - 1)) * 2.0 - 1.0
+            u_r_tex = np.arcsin(np.clip(u_r, -0.9999, 0.9999) * sin_max) / max_angle
+            map_x = (u_r_tex + 1.0) * 0.5 * float(w - 1)
+        map_x = np.tile(map_x, (h, 1)).astype(np.float32)
 
     warped = cv2.remap(
         image,
-        map_x,
-        map_y,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
         interpolation=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0) if image.shape[2] == 4 else (0, 0, 0)
+        borderValue=(0, 0, 0, 0) if has_alpha else (0, 0, 0),
     )
     return warped
 
@@ -90,36 +106,35 @@ def build_3tier_control_grid(
     tray_to_hand_scale: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Constructs an Anatomically Nail-Bed Locked 3-tier (9-point) TPS control grid
-    calibrated against real worn press-on nail references (`test_assets/references/`):
-      1. Width Locked to the Natural Nail Bed (`frame_half_w = 0.55 * bed_w`):
-         - Never inflates the nail wider than the finger's lateral skin folds (`c_l..d_l`
-           and `c_r..d_r`), preserving a clean border of finger skin on both sides.
-      2. Preserves Each Nail's True Relative Length from the Tray Image (`tray_to_hand_scale`):
-         - When `tray_to_hand_scale` is provided (computed across the 5-nail tray set),
-           each nail's rendered length on the hand is `src_h * tray_to_hand_scale * length_scale`.
-         - This guarantees that the exact physical height graduation of the nails in the tray
-           (e.g. `264px -> 237px -> 235px -> 221px -> 204px`) is 100% preserved on the hand!
-      3. Uniform Vertical Mapping (`Row 2` at `y = 0.55 * src_h` -> `45%` of total length):
-         - Prevents vertical stretching of the mid-body so the nail's single-arc Almond/Oval
-           silhouette from the tray is preserved without capsule/sausage distortion.
+    Constructs an Orthogonal, Silhouette-Preserving 3-tier (9-point) control grid
+    calibrated against real worn press-on nail references:
+      1. Strictly Orthogonal Frame (`perp_unit` perpendicular to `axis_unit`):
+         - Eliminates parallelogram shear/skew when `d_r - d_l` is slightly angled,
+           so the nail's bilateral symmetry around the finger axis is 100% preserved.
+      2. Linear Longitudinal Mapping (`Row 1` at `y = src_h` -> `0%`, `Row 2` at `0.50 * src_h`
+         -> `50%`, `Row 3` at `0.0` -> `100%`):
+         - Keeps the upper nail body rigid so the true ovoid/almond equator placement and
+           smooth tip taper from the extracted nail are never inflated into a capsule.
+      3. Preserves Each Nail's True Relative Length from the Tray Image (`tray_to_hand_scale`).
 
     Returns:
       (src_points [9, 2], dst_points [9, 2])
     """
+    pad_x = min(6.0, src_w * 0.05)
+    pad_y = min(5.5, src_h * 0.025)
     src_pts = np.array([
-        # Row 1: Cuticle base frame (maps to proximal cuticle fold c_l, c_c, c_r)
-        [0.0, src_h * 0.85],
-        [src_w * 0.5, src_h],
-        [src_w, src_h * 0.85],
-        # Row 2: Mid-bed widest arch (y = 0.55 * src_h maps to 45% along the nail length — zero vertical stretch!)
-        [0.0, src_h * 0.55],
-        [src_w * 0.5, src_h * 0.55],
-        [src_w, src_h * 0.55],
-        # Row 3: Free-edge tip bounding frame (top of cutout y = 0.0 extends past fingertip)
-        [0.0, 0.0],
-        [src_w * 0.5, 0.0],
-        [src_w, 0.0],
+        # Row 1: Cuticle base frame (aligned to the true active bounds of the nail mask inside the 6px border)
+        [pad_x, src_h - pad_y],
+        [src_w * 0.5, src_h - pad_y],
+        [src_w - pad_x, src_h - pad_y],
+        # Row 2: Mid-body line (y = 0.50 * src_h maps to 50% along extension_dist — zero vertical stretch!)
+        [pad_x, src_h * 0.50],
+        [src_w * 0.5, src_h * 0.50],
+        [src_w - pad_x, src_h * 0.50],
+        # Row 3: Free-edge tip frame (aligned to the true top of the nail mask inside the 6px border)
+        [pad_x, pad_y],
+        [src_w * 0.5, pad_y],
+        [src_w - pad_x, pad_y],
     ], dtype=np.float64)
 
     c_l = np.array(cuticle_left, dtype=np.float64)
@@ -129,83 +144,72 @@ def build_3tier_control_grid(
     d_l = np.array(distal_left, dtype=np.float64)
     d_r = np.array(distal_right, dtype=np.float64)
 
-    # Finger centerline axis vector (from cuticle center to distal midpoint)
+    # Finger centerline axis vector (from cuticle center through distal midpoint)
     distal_mid = (d_l + d_r) * 0.5
     axis_vector = distal_mid - c_c
-    bed_length = np.linalg.norm(axis_vector)
+    bed_length = float(np.linalg.norm(axis_vector))
     if bed_length > 0:
         axis_unit = axis_vector / bed_length
     else:
-        axis_unit = np.array([0.0, -1.0])
+        axis_unit = np.array([0.0, -1.0], dtype=np.float64)
 
-    # Orthogonal unit vector pointing from left sidewall to right sidewall
-    perp_vec = d_r - d_l
-    distal_width = np.linalg.norm(perp_vec)
-    if distal_width > 0:
-        perp_unit = perp_vec / distal_width
-    else:
-        perp_unit = np.array([1.0, 0.0])
+    # Strictly orthogonal transverse unit vector (eliminates shear distortion)
+    perp_unit = np.array([-axis_unit[1], axis_unit[0]], dtype=np.float64)
+    if np.dot(perp_unit, d_r - d_l) < 0:
+        perp_unit = -perp_unit
 
-    cuticle_width = np.linalg.norm(c_r - c_l)
+    distal_width = float(np.linalg.norm(d_r - d_l))
+    cuticle_width = float(np.linalg.norm(c_r - c_l))
     bed_width = max(distal_width, cuticle_width)
 
-    # Strict 1.15x nail-bed half-width (`0.575 * bed_width`) so the nail covers 100% of the
-    # natural nail bed while sitting strictly INSIDE the finger's lateral skin folds!
-    frame_half_w = bed_width * 0.575
+    # Nail-bed half-width (`0.545 * bed_width`) covers the natural nail bed while preserving
+    # a sleek ~1:2.0 ovoid/almond aspect ratio and leaving natural finger skin on both sides
+    frame_half_w = bed_width * 0.545
 
-    # Preserve each nail's true length from the tray image!
+    # Preserve each nail's true length from the tray image
     if tray_to_hand_scale is not None and tray_to_hand_scale > 0:
-        # Direct proportional mapping from the extracted tray nail's pixel height `src_h`
-        # so the exact height slope across the tray (Slot 1 > Slot 2 > Slot 3 > Slot 4 > Slot 5)
-        # is 100% preserved on the hand without being overridden by bed_length!
         user_mult = length_scale if (length_scale is not None and 0.5 <= length_scale <= 2.0) else 1.0
         extension_dist = float(src_h) * tray_to_hand_scale * user_mult
     else:
         nail_aspect = float(src_h) / max(1.0, float(src_w))
-        auto_total_len = bed_width * nail_aspect * 0.78
+        auto_total_len = (2.0 * frame_half_w) * nail_aspect
         if length_scale is not None and length_scale > 1.25:
             extension_dist = max(bed_length * length_scale, auto_total_len)
         else:
             extension_dist = max(bed_length * 1.34, auto_total_len)
 
-    # Row 1: Cuticle base frame (locked to the cuticle width)
-    cuticle_chord_mid = 0.5 * (c_l + c_r)
     if abs(roll_offset) > 0.05:
-        base_left = c_l - perp_unit * (frame_half_w * 0.04)
-        base_right = c_r + perp_unit * (frame_half_w * 0.08)
+        # 3/4 lateral profile thumb adjustment
+        base_left = c_c - perp_unit * (frame_half_w * 0.92)
+        base_right = c_c + perp_unit * (frame_half_w * 0.98)
+        apex_center = c_c + axis_unit * (extension_dist * 0.50)
+        apex_left = apex_center - perp_unit * (frame_half_w * 0.95)
+        apex_right = apex_center + perp_unit * (frame_half_w * 1.02)
     else:
-        base_left = cuticle_chord_mid - perp_unit * (frame_half_w * 0.96)
-        base_right = cuticle_chord_mid + perp_unit * (frame_half_w * 0.96)
-
-    # Row 2: Mid-bed line (anchored at 52% of extension_dist so the widest part of the nail sits high enough to cover 100% of d_l/d_r!)
-    apex_center = c_c + axis_unit * (extension_dist * 0.52)
-    if abs(roll_offset) > 0.05:
-        left_distal_chord = 0.40 * c_l + 0.60 * d_l
-        right_distal_chord = 0.40 * c_r + 0.60 * d_r
-        left_bow = frame_half_w * (0.05 - 0.04 * roll_offset)
-        right_bow = frame_half_w * (0.05 - 0.14 * roll_offset)
-        apex_left = left_distal_chord - perp_unit * left_bow
-        apex_right = right_distal_chord + perp_unit * right_bow
-    else:
+        # Strictly orthogonal rectangle aligned to (axis_unit, perp_unit)
+        # Preserves 100% of the extracted nail's G2-smooth ovoid/almond silhouette!
+        base_left = c_c - perp_unit * frame_half_w
+        base_right = c_c + perp_unit * frame_half_w
+        apex_center = c_c + axis_unit * (extension_dist * 0.50)
         apex_left = apex_center - perp_unit * frame_half_w
         apex_right = apex_center + perp_unit * frame_half_w
 
-    # Row 3: Extended free-edge tip frame (parallel to Row 2: tip_half_w == frame_half_w * tip_taper)
+    # Row 3: Extended free-edge tip frame
     tip_center = c_c + axis_unit * extension_dist
     tip_half_w = frame_half_w * tip_taper
     tip_left = tip_center - perp_unit * tip_half_w
     tip_right = tip_center + perp_unit * tip_half_w
 
     dst_pts = np.array([
-        # Row 1: Cuticle base frame
+        # Row 1: Cuticle base frame (s = 0.0)
         base_left,
         c_c,
         base_right,
-        # Row 2: Distal nail-bed line (fingertip)
+        # Row 2: Mid-body line (s = 0.50)
         apex_left,
         apex_center,
         apex_right,
-        # Row 3: Extended Tip Frame (parallel to Row 2)
+        # Row 3: Extended Tip Frame (s = 1.00)
         tip_left,
         tip_center,
         tip_right,
@@ -224,11 +228,10 @@ def build_cuticle_pocket_mask(
     feather_sigma: float = 1.8,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Constructs a smooth, high-precision anatomical U-curve mask along the proximal
-    cuticle fold and lateral nail grooves (peronychium) so that:
-      1. Any portion of the warped press-on nail that overflows below the cuticle fold
-         or outside the lateral skin folds is cleanly masked out (i.e. the finger's
-         cuticle skin and sidewall skin sit ON TOP of the nail edges).
+    Constructs a G2-smooth anatomical U-curve mask along the proximal cuticle fold
+    and lateral nail grooves (peronychium) so that:
+      1. The cuticle U-cup transitions with a strictly parallel tangent into the left
+         and right sidewalls (zero polygonal corners or 45-degree chops at c_l / c_r).
       2. A subtle 1.5px-2.5px contact shadow (ambient occlusion) is generated right at
          the cuticle pocket where the nail tucks under the proximal skin lip.
 
@@ -251,46 +254,37 @@ def build_cuticle_pocket_mask(
     axis_vec = distal_mid - c_c
     bed_len = max(1.0, float(np.linalg.norm(axis_vec)))
     axis_unit = axis_vec / bed_len
-    perp_unit = np.array([-axis_unit[1], axis_unit[0]])
+    perp_unit = np.array([-axis_unit[1], axis_unit[0]], dtype=np.float64)
+    if np.dot(perp_unit, d_r - d_l) < 0:
+        perp_unit = -perp_unit
 
-    # Build a smooth U-shaped polygon representing the exposed nail plate + free-edge extension:
-    # - Along the bottom: a 25-point quadratic/cubic Bézier U-curve passing cleanly through
-    #   c_l -> c_c -> c_r so the proximal cuticle skin overlaps the base of the nail.
-    # - Along the left and right sidewalls: smooth curves from c_l -> d_l and c_r -> d_r,
-    #   then flaring out above d_l and d_r so the free-edge tip (beyond the finger) is never clipped.
-    ctrl_mid = 2.0 * c_c - 0.5 * (c_l + c_r)
-    t_vals = np.linspace(0.0, 1.0, 29)
-    cuticle_curve = (
-        ((1.0 - t_vals) ** 2)[:, None] * c_l[None, :]
-        + (2.0 * (1.0 - t_vals) * t_vals)[:, None] * ctrl_mid[None, :]
-        + (t_vals ** 2)[:, None] * c_r[None, :]
+    distal_w = float(np.linalg.norm(d_r - d_l))
+    cuticle_w = float(np.linalg.norm(c_r - c_l))
+    bed_w = max(distal_w, cuticle_w)
+
+    # Match the pocket width to the nail's equator width (`0.555 * bed_w`) at s_eq = 0.38
+    # and form a G1-tangent semi-elliptical U-cup around c_c so there is NEVER a sharp corner at c_l/c_r!
+    pocket_half_w = bed_w * 0.565
+    s_eq = 0.38 * bed_len
+
+    # Semi-elliptical U-cup from left equator (theta = pi) through c_c (theta = pi/2) to right equator (theta = 0)
+    thetas = np.linspace(np.pi, 0.0, 45, dtype=np.float64)
+    eq_center = c_c + axis_unit * s_eq
+    u_cup_pts = (
+        eq_center[None, :]
+        + ( np.cos(thetas) * pocket_half_w)[:, None] * perp_unit[None, :]
+        - (np.sin(thetas) * s_eq)[:, None] * axis_unit[None, :]
     )
 
-    # Left and right lateral nail-groove curves from cuticle to distal free edge
-    # Only enforce the sidewall tuck on the lower 78% of the nail bed (s in [0.05, 0.78])
-    # with a 7.5% bow so the nail is strictly seated inside the finger's lateral
-    # nail grooves and leaves a natural border of finger skin on BOTH left and right sides!
-    s_vals = np.linspace(0.05, 0.78, 12)
-    bed_w = np.linalg.norm(d_r - d_l)
-    bow = (4.0 * s_vals * (1.0 - s_vals))[:, None] * (0.075 * bed_w)
-
-    right_sidewall = (1.0 - s_vals)[:, None] * c_r[None, :] + s_vals[:, None] * d_r[None, :] + bow * perp_unit[None, :]
-    left_sidewall = (1.0 - s_vals[::-1])[:, None] * c_l[None, :] + s_vals[::-1][:, None] * d_l[None, :] - bow[::-1] * perp_unit[None, :]
-
-    # Above s = 0.78, flare wide open so the entire free-edge tip extending past the fingertip
-    # is 100% shaped by the press-on nail's own smooth, unbroken arc
-    far_right_0 = (0.15 * c_r + 0.85 * d_r) + perp_unit * (bed_w * 0.25)
-    far_right_1 = d_r + axis_unit * (bed_len * 0.15) + perp_unit * (bed_w * 0.40)
-    far_right_2 = d_r + axis_unit * (bed_len * 1.40) + perp_unit * (bed_w * 0.55)
-    far_left_2 = d_l + axis_unit * (bed_len * 1.40) - perp_unit * (bed_w * 0.55)
-    far_left_1 = d_l + axis_unit * (bed_len * 0.15) - perp_unit * (bed_w * 0.40)
-    far_left_0 = (0.15 * c_l + 0.85 * d_l) - perp_unit * (bed_w * 0.25)
+    # Above s_eq, flare smoothly outward so the upper nail body and free-edge tip are 100% unclipped
+    far_right_1 = c_c + axis_unit * (bed_len * 0.85) + perp_unit * (bed_w * 0.65)
+    far_right_2 = c_c + axis_unit * (bed_len * 2.20) + perp_unit * (bed_w * 0.80)
+    far_left_2 = c_c + axis_unit * (bed_len * 2.20) - perp_unit * (bed_w * 0.80)
+    far_left_1 = c_c + axis_unit * (bed_len * 0.85) - perp_unit * (bed_w * 0.65)
 
     poly_pts = np.vstack([
-        cuticle_curve,
-        right_sidewall,
-        [far_right_0, far_right_1, far_right_2, far_left_2, far_left_1, far_left_0],
-        left_sidewall,
+        u_cup_pts,
+        [far_right_1, far_right_2, far_left_2, far_left_1],
     ]).astype(np.int32)
 
     # Render at 4x supersampling for sub-pixel smooth cuticle & sidewall boundaries
@@ -305,9 +299,9 @@ def build_cuticle_pocket_mask(
         pocket_allow = cv2.GaussianBlur(pocket_allow, (ksize, ksize), feather_sigma)
 
     # Generate subtle Cuticle & Sidewall Pocket Ambient Occlusion (AO) shadow
-    # right inside the cuticle curve and lateral nail folds so the nail looks tucked IN
+    # along the lower U-cup curve so the nail looks naturally tucked into the proximal fold
     cuticle_line_ss = np.zeros((rh * ss, rw * ss), dtype=np.uint8)
-    groove_pts = np.vstack([left_sidewall[-6:], cuticle_curve, right_sidewall[:6]])
+    groove_pts = u_cup_pts[6:-6]
     cv2.polylines(
         cuticle_line_ss,
         [(groove_pts * ss).astype(np.int32).reshape(-1, 1, 2)],

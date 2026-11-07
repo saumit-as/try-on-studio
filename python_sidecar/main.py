@@ -76,12 +76,16 @@ def handle_extract_nail(params):
     feather_px = float(params.get("feather_px", 1.2))
     deskew = bool(params.get("deskew", True))
     auto_orient = bool(params.get("auto_orient_cuticle_down", True))
+    homography = None
+    if "homography" in params and params["homography"] is not None:
+        homography = np.array(params["homography"], dtype=np.float64)
     rgba = extract_nail_rgba(
         img,
         contour,
         feather_px=feather_px,
         deskew=deskew,
         auto_orient_cuticle_down=auto_orient,
+        homography=homography,
     )
 
     # Encode as PNG base64
