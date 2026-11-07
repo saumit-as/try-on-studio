@@ -7,7 +7,7 @@ import { ActiveTab, SidecarStatus, LightingState, TrayState } from "./types";
 import "./App.css";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("composite");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("tray");
   const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus>("checking");
   const [sidecarVersion, setSidecarVersion] = useState<string>("");
 
@@ -24,6 +24,11 @@ export default function App() {
 
   // Tray State
   const [trayState, setTrayState] = useState<TrayState>({
+    trayImageSrc: null,
+    trayImageSize: null,
+    isSegmenting: false,
+    segmentError: null,
+    detectedSlots: [],
     selectedSlot: 1,
     slotFinger: {
       1: "Thumb",
@@ -32,7 +37,11 @@ export default function App() {
       4: "Ring",
       5: "Pinky",
     },
-    nailRotation: 0,
+    nailRotation: {},
+    slotInverted: {},
+    shapeOverrides: {},
+    extractedPreviews: {},
+    hoveredSlot: null,
   });
 
   // Check Python sidecar connection
@@ -67,7 +76,11 @@ export default function App() {
       {/* Main Workspace Layout */}
       <div className="flex flex-1 overflow-hidden">
         {/* Left / Center Interactive Canvas Viewport */}
-        <CanvasViewport activeTab={activeTab} />
+        <CanvasViewport
+          activeTab={activeTab}
+          trayState={trayState}
+          setTrayState={setTrayState}
+        />
 
         {/* Right Parameter & Tooling Inspector */}
         <InspectorPanel
