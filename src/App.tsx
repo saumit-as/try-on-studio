@@ -45,6 +45,7 @@ export default function App() {
     isManualEditMode: false,
     originalSlots: {},
     activeTool: "select",
+    slotPenAnchors: {},
   });
 
   // Check Python sidecar connection

@@ -27,6 +27,7 @@ export interface DetectedSlot {
     metrics: Record<string, any>;
   };
   card_quad?: [number, number][];
+  pen_anchors?: PenAnchor[];
 }
 
 export interface LightingState {
@@ -62,4 +63,5 @@ export interface TrayState {
   isManualEditMode: boolean;
   originalSlots: Record<number, DetectedSlot>;
   activeTool: "select" | "pen" | "pan";
+  slotPenAnchors: Record<number, PenAnchor[]>;
 }

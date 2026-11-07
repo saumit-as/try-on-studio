@@ -25,6 +25,7 @@ import {
   Undo2,
   Check,
   X,
+  Wand2,
 } from "lucide-react";
 import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor } from "../../types";
 import { callSidecar } from "../../services/sidecar";
@@ -117,6 +118,53 @@ function constructPathD(
   return d;
 }
 
+// Generate smooth default Bezier curve anchors from bounding box for instant editing
+function generateDefaultPenAnchors(bbox: [number, number, number, number]): PenAnchor[] {
+  const [bx, by, bw, bh] = bbox;
+  const cx = Math.round(bx + bw / 2);
+  const topY = by;
+  const botY = by + bh;
+
+  return [
+    {
+      x: cx,
+      y: topY,
+      handleIn: [Math.round(cx - bw * 0.28), topY],
+      handleOut: [Math.round(cx + bw * 0.28), topY],
+    },
+    {
+      x: bx + bw,
+      y: Math.round(by + bh * 0.4),
+      handleIn: [bx + bw, Math.round(by + bh * 0.22)],
+      handleOut: [bx + bw, Math.round(by + bh * 0.65)],
+    },
+    {
+      x: Math.round(bx + bw * 0.88),
+      y: Math.round(by + bh * 0.88),
+      handleIn: [Math.round(bx + bw * 0.94), Math.round(by + bh * 0.78)],
+      handleOut: [Math.round(bx + bw * 0.75), Math.round(by + bh * 0.98)],
+    },
+    {
+      x: cx,
+      y: botY,
+      handleIn: [Math.round(cx + bw * 0.2), botY],
+      handleOut: [Math.round(cx - bw * 0.2), botY],
+    },
+    {
+      x: Math.round(bx + bw * 0.12),
+      y: Math.round(by + bh * 0.88),
+      handleIn: [Math.round(bx + bw * 0.25), Math.round(by + bh * 0.98)],
+      handleOut: [Math.round(bx + bw * 0.06), Math.round(by + bh * 0.78)],
+    },
+    {
+      x: bx,
+      y: Math.round(by + bh * 0.4),
+      handleIn: [bx, Math.round(by + bh * 0.65)],
+      handleOut: [bx, Math.round(by + bh * 0.22)],
+    },
+  ];
+}
+
 export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   activeTab,
   trayState,
@@ -138,8 +186,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
   // Photoshop-Style Bezier Pen Tool State
   const [penAnchors, setPenAnchors] = useState<PenAnchor[]>([]);
+  const [isPathClosed, setIsPathClosed] = useState<boolean>(false);
   const [currentMousePos, setCurrentMousePos] = useState<[number, number] | null>(null);
   const [isNearStartPoint, setIsNearStartPoint] = useState<boolean>(false);
+  const [isAltPressed, setIsAltPressed] = useState<boolean>(false);
   const penDragRef = useRef<{
     active: boolean;
     anchorIndex: number;
@@ -148,6 +198,31 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     startY: number;
     initialAnchor?: PenAnchor;
   } | null>(null);
+
+  // Auto-load saved pen pattern for selected slot when in Pen Tool (allows editing existing patterns)
+  useEffect(() => {
+    if (trayState.activeTool === "pen") {
+      const saved = trayState.slotPenAnchors?.[trayState.selectedSlot];
+      if (saved && saved.length > 0) {
+        setPenAnchors(JSON.parse(JSON.stringify(saved)));
+        setIsPathClosed(true);
+      } else {
+        setPenAnchors([]);
+        setIsPathClosed(false);
+      }
+    }
+  }, [trayState.selectedSlot, trayState.activeTool, trayState.slotPenAnchors]);
+
+  // Convert auto-detected contour to 6 editable Bezier anchors
+  const handleConvertAutoToPen = () => {
+    const activeSlot = trayState.detectedSlots.find(
+      (s) => s.slot_id === trayState.selectedSlot
+    );
+    if (!activeSlot) return;
+    const defaultAnchors = generateDefaultPenAnchors(activeSlot.bbox);
+    setPenAnchors(defaultAnchors);
+    setIsPathClosed(true);
+  };
 
   const processFile = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -370,6 +445,85 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     };
   };
 
+  // Handle clicking directly on an anchor point
+  const handleAnchorMouseDown = (e: ReactMouseEvent, idx: number) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const pt = getSvgPoint(e);
+    if (!pt) return;
+
+    if (e.altKey || isAltPressed) {
+      // Alt-click on an anchor: toggle handles (collapse to sharp corner)
+      const anchor = penAnchors[idx];
+      const hasHandles =
+        Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 2 ||
+        Math.hypot(anchor.handleIn[0] - anchor.x, anchor.handleIn[1] - anchor.y) > 2;
+
+      if (hasHandles) {
+        // Collapse handles to convert smooth point into a sharp corner
+        setPenAnchors((prev) => {
+          const next = [...prev];
+          if (next[idx]) {
+            next[idx] = {
+              ...next[idx],
+              handleIn: [next[idx].x, next[idx].y],
+              handleOut: [next[idx].x, next[idx].y],
+            };
+          }
+          return next;
+        });
+        return;
+      } else {
+        // Drag out new tangent handles from sharp corner
+        penDragRef.current = {
+          active: true,
+          anchorIndex: idx,
+          dragType: "create-tangent",
+          startX: anchor.x,
+          startY: anchor.y,
+        };
+        return;
+      }
+    }
+
+    // Clicking start point when path is open and >= 3 points closes the loop without exiting
+    if (!isPathClosed && idx === 0 && penAnchors.length >= 3) {
+      setIsPathClosed(true);
+      setIsNearStartPoint(false);
+      return;
+    }
+
+    // Move anchor point
+    penDragRef.current = {
+      active: true,
+      anchorIndex: idx,
+      dragType: "move-anchor",
+      startX: pt[0],
+      startY: pt[1],
+      initialAnchor: { ...penAnchors[idx] },
+    };
+  };
+
+  // Handle clicking directly on a blue tangent handle (direction point)
+  const handleHandleMouseDown = (
+    e: ReactMouseEvent,
+    idx: number,
+    handleType: "handleOut" | "handleIn"
+  ) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const pt = getSvgPoint(e);
+    if (!pt) return;
+
+    penDragRef.current = {
+      active: true,
+      anchorIndex: idx,
+      dragType: handleType === "handleOut" ? "move-handle-out" : "move-handle-in",
+      startX: pt[0],
+      startY: pt[1],
+    };
+  };
+
   // SVG mouse down handler: supports hold-and-drag Photoshop-style Pen Tool curving
   const handleSvgMouseDown = (e: ReactMouseEvent<SVGSVGElement>) => {
     if (e.button === 1 || isSpacePressed || trayState.activeTool === "pan") {
@@ -383,13 +537,17 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       const pt = getSvgPoint(e);
       if (!pt) return;
 
-      // 1. If clicking near start point and has >= 3 anchors, finish and close path!
+      // If loop is already closed, don't add random points on empty click
+      if (isPathClosed) return;
+
+      // If clicking near start point and has >= 3 anchors, close the loop!
       if (penAnchors.length >= 3 && isNearStartPoint) {
-        finishPenPath();
+        setIsPathClosed(true);
+        setIsNearStartPoint(false);
         return;
       }
 
-      // 2. Add new anchor and start tangent handle dragging
+      // Add new anchor and start tangent handle dragging
       const newAnchor: PenAnchor = {
         x: Math.round(pt[0]),
         y: Math.round(pt[1]),
@@ -422,17 +580,26 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         const { anchorIndex, dragType, startX, startY } = penDragRef.current;
         const dx = pt[0] - startX;
         const dy = pt[1] - startY;
+        const isBreaking = e.altKey || isAltPressed;
 
         if (dragType === "create-tangent") {
-          // Photoshop hold-and-drag: handleOut follows cursor, handleIn reflects symmetrically
+          // Photoshop hold-and-drag: handleOut follows cursor, handleIn reflects symmetrically unless Alt held
           setPenAnchors((prev) => {
             const next = [...prev];
             if (next[anchorIndex]) {
-              next[anchorIndex] = {
-                ...next[anchorIndex],
-                handleOut: [Math.round(startX + dx), Math.round(startY + dy)],
-                handleIn: [Math.round(startX - dx), Math.round(startY - dy)],
-              };
+              const anchor = next[anchorIndex];
+              if (isBreaking) {
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleOut: [Math.round(startX + dx), Math.round(startY + dy)],
+                };
+              } else {
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleOut: [Math.round(startX + dx), Math.round(startY + dy)],
+                  handleIn: [Math.round(startX - dx), Math.round(startY - dy)],
+                };
+              }
             }
             return next;
           });
@@ -440,10 +607,24 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           setPenAnchors((prev) => {
             const next = [...prev];
             if (next[anchorIndex]) {
-              next[anchorIndex] = {
-                ...next[anchorIndex],
-                handleOut: [Math.round(pt[0]), Math.round(pt[1])],
-              };
+              const anchor = next[anchorIndex];
+              const newHandleOut: [number, number] = [Math.round(pt[0]), Math.round(pt[1])];
+              if (isBreaking) {
+                // BREAK CURVE: only move handleOut, leave handleIn unchanged!
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleOut: newHandleOut,
+                };
+              } else {
+                // Symmetrical tangent handle adjustment
+                const hdx = newHandleOut[0] - anchor.x;
+                const hdy = newHandleOut[1] - anchor.y;
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleOut: newHandleOut,
+                  handleIn: [Math.round(anchor.x - hdx), Math.round(anchor.y - hdy)],
+                };
+              }
             }
             return next;
           });
@@ -451,10 +632,24 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           setPenAnchors((prev) => {
             const next = [...prev];
             if (next[anchorIndex]) {
-              next[anchorIndex] = {
-                ...next[anchorIndex],
-                handleIn: [Math.round(pt[0]), Math.round(pt[1])],
-              };
+              const anchor = next[anchorIndex];
+              const newHandleIn: [number, number] = [Math.round(pt[0]), Math.round(pt[1])];
+              if (isBreaking) {
+                // BREAK CURVE: only move handleIn, leave handleOut unchanged!
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleIn: newHandleIn,
+                };
+              } else {
+                // Symmetrical tangent handle adjustment
+                const hdx = newHandleIn[0] - anchor.x;
+                const hdy = newHandleIn[1] - anchor.y;
+                next[anchorIndex] = {
+                  ...anchor,
+                  handleIn: newHandleIn,
+                  handleOut: [Math.round(anchor.x - hdx), Math.round(anchor.y - hdy)],
+                };
+              }
             }
             return next;
           });
@@ -476,8 +671,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         return;
       }
 
-      // Check snapping to start point
-      if (penAnchors.length >= 3) {
+      // Check snapping to start point (only if path is not yet closed)
+      if (!isPathClosed && penAnchors.length >= 3) {
         const snapRadius = Math.max(14, 22 / Math.max(0.3, zoom));
         const d = Math.hypot(pt[0] - penAnchors[0].x, pt[1] - penAnchors[0].y);
         setIsNearStartPoint(d <= snapRadius);
@@ -621,7 +816,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     endDrag();
   };
 
-  // Complete and apply custom pen drawn curved contour
+  // Complete and apply custom pen drawn curved contour (persists to slotPenAnchors)
   const finishPenPath = () => {
     if (penAnchors.length < 3) return;
 
@@ -653,18 +848,22 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     const bh = Math.max(16, maxY - minY);
     const newBbox: [number, number, number, number] = [minX, minY, bw, bh];
 
+    const currentSlotId = trayState.selectedSlot;
+    const savedAnchors = JSON.parse(JSON.stringify(penAnchors));
+
     setTrayState((prev) => {
       const updatedSlots = prev.detectedSlots.map((s) =>
-        s.slot_id === prev.selectedSlot
+        s.slot_id === currentSlotId
           ? {
               ...s,
               bbox: newBbox,
               contour: denseContour,
+              pen_anchors: savedAnchors,
             }
           : s
       );
 
-      const activeSlot = updatedSlots.find((s) => s.slot_id === prev.selectedSlot);
+      const activeSlot = updatedSlots.find((s) => s.slot_id === currentSlotId);
       if (activeSlot && prev.trayImageSrc) {
         fetchNailPreview(prev.trayImageSrc, activeSlot);
       }
@@ -672,15 +871,19 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       return {
         ...prev,
         detectedSlots: updatedSlots,
+        slotPenAnchors: {
+          ...prev.slotPenAnchors,
+          [currentSlotId]: savedAnchors,
+        },
         extractedPreviews: {
           ...prev.extractedPreviews,
-          [prev.selectedSlot]: "",
+          [currentSlotId]: "",
         },
         activeTool: "select",
       };
     });
 
-    setPenAnchors([]);
+    setIsPathClosed(false);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
     penDragRef.current = null;
@@ -688,6 +891,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
   const cancelPenDrawing = () => {
     setPenAnchors([]);
+    setIsPathClosed(false);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
     penDragRef.current = null;
@@ -695,7 +899,12 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   };
 
   const undoLastPenPoint = () => {
-    setPenAnchors((prev) => prev.slice(0, -1));
+    if (isPathClosed) {
+      // Re-open closed loop so user can adjust
+      setIsPathClosed(false);
+    } else {
+      setPenAnchors((prev) => prev.slice(0, -1));
+    }
   };
 
   const endDrag = () => {
@@ -719,14 +928,23 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     });
   };
 
-  // Keyboard shortcut listeners (Space for pan, P for pen, V for select, Esc/Backspace)
+  // Keyboard shortcut listeners (Ctrl+Z, Space for pan, P for pen, V for select, Alt for break, Esc/Backspace)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return;
       }
+      if (e.key === "Alt") {
+        setIsAltPressed(true);
+      }
       if (e.code === "Space" && !e.repeat) {
         setIsSpacePressed(true);
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
+        // Control + Z: Undo last point / re-open loop
+        if (trayState.activeTool === "pen") {
+          e.preventDefault();
+          undoLastPenPoint();
+        }
       } else if (e.key === "p" || e.key === "P") {
         setTrayState((prev) => ({ ...prev, activeTool: "pen", isManualEditMode: false }));
       } else if (e.key === "v" || e.key === "V") {
@@ -738,7 +956,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           cancelPenDrawing();
         }
       } else if (e.key === "Backspace" || e.key === "Delete") {
-        if (penAnchors.length > 0) {
+        if (trayState.activeTool === "pen" && penAnchors.length > 0) {
+          e.preventDefault();
           undoLastPenPoint();
         }
       } else if (e.key === "Enter") {
@@ -749,6 +968,9 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Alt") {
+        setIsAltPressed(false);
+      }
       if (e.code === "Space") {
         setIsSpacePressed(false);
       }
@@ -760,7 +982,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [penAnchors, setTrayState]);
+  }, [penAnchors, isPathClosed, isAltPressed, setTrayState]);
 
   // Global mouse listeners for panning and ending drags outside the SVG
   useEffect(() => {
@@ -1138,8 +1360,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                           {/* Dynamic Cubic Bezier Spline Path */}
                           {penAnchors.length > 0 && (
                             <path
-                              d={constructPathD(penAnchors, false, null, false)}
-                              fill={penAnchors.length >= 3 ? "rgba(245, 158, 11, 0.22)" : "none"}
+                              d={constructPathD(penAnchors, isPathClosed, null, false)}
+                              fill={isPathClosed || penAnchors.length >= 3 ? "rgba(245, 158, 11, 0.22)" : "none"}
                               stroke="#f59e0b"
                               strokeWidth={Math.max(1.5, 2.5 / Math.max(0.3, zoom))}
                               strokeLinejoin="round"
@@ -1148,8 +1370,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                             />
                           )}
 
-                          {/* Live Rubberband Bezier Curve to Cursor */}
-                          {penAnchors.length > 0 && currentMousePos && !penDragRef.current?.active && (
+                          {/* Live Rubberband Bezier Curve to Cursor (Only while path is open) */}
+                          {penAnchors.length > 0 && !isPathClosed && currentMousePos && !penDragRef.current?.active && (
                             <path
                               d={`M ${penAnchors[penAnchors.length - 1].x} ${
                                 penAnchors[penAnchors.length - 1].y
@@ -1183,11 +1405,12 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                           {/* Tangent Handles and Anchor Points */}
                           {penAnchors.map((anchor, idx) => {
                             const screenScale = 1 / Math.max(0.2, zoom);
-                            const ptSize = Math.max(5, 8 * screenScale);
+                            const ptSize = Math.max(6, 9 * screenScale);
                             const halfPt = ptSize / 2;
-                            const handleRadius = Math.max(3, 5 * screenScale);
+                            const handleRadius = Math.max(3.5, 5 * screenScale);
+                            const hitRadius = Math.max(12, 18 * screenScale);
                             const isStart = idx === 0;
-                            const isSnapping = isStart && isNearStartPoint && penAnchors.length >= 3;
+                            const isSnapping = !isPathClosed && isStart && isNearStartPoint && penAnchors.length >= 3;
                             const hasOutHandle =
                               Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 1.5;
                             const hasInHandle =
@@ -1195,9 +1418,9 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
                             return (
                               <g key={idx}>
-                                {/* Outgoing Tangent Bar & Handle Dot */}
+                                {/* Outgoing Tangent Bar & Blue Handle Dot */}
                                 {hasOutHandle && (
-                                  <>
+                                  <g className="tangent-out-group">
                                     <line
                                       x1={anchor.x}
                                       y1={anchor.y}
@@ -1207,34 +1430,31 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       strokeWidth={Math.max(1, 1.2 * screenScale)}
                                       className="pointer-events-none"
                                     />
+                                    {/* Generous invisible hit target for effortless grabbing */}
+                                    <circle
+                                      cx={anchor.handleOut[0]}
+                                      cy={anchor.handleOut[1]}
+                                      r={hitRadius}
+                                      fill="transparent"
+                                      className="cursor-pointer pointer-events-auto"
+                                      onMouseDown={(e) => handleHandleMouseDown(e, idx, "handleOut")}
+                                    />
+                                    {/* Visible blue handle dot */}
                                     <circle
                                       cx={anchor.handleOut[0]}
                                       cy={anchor.handleOut[1]}
                                       r={handleRadius}
-                                      fill="#38bdf8"
+                                      fill="#0284c7"
                                       stroke="#ffffff"
-                                      strokeWidth={screenScale}
-                                      className="cursor-crosshair pointer-events-auto shadow-sm"
-                                      onMouseDown={(e) => {
-                                        e.stopPropagation();
-                                        e.preventDefault();
-                                        const pt = getSvgPoint(e);
-                                        if (!pt) return;
-                                        penDragRef.current = {
-                                          active: true,
-                                          anchorIndex: idx,
-                                          dragType: "move-handle-out",
-                                          startX: pt[0],
-                                          startY: pt[1],
-                                        };
-                                      }}
+                                      strokeWidth={Math.max(1.5, 2 * screenScale)}
+                                      className="pointer-events-none drop-shadow-md"
                                     />
-                                  </>
+                                  </g>
                                 )}
 
-                                {/* Incoming Tangent Bar & Handle Dot */}
+                                {/* Incoming Tangent Bar & Blue Handle Dot */}
                                 {hasInHandle && (
-                                  <>
+                                  <g className="tangent-in-group">
                                     <line
                                       x1={anchor.x}
                                       y1={anchor.y}
@@ -1244,29 +1464,26 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       strokeWidth={Math.max(1, 1.2 * screenScale)}
                                       className="pointer-events-none"
                                     />
+                                    {/* Generous invisible hit target for effortless grabbing */}
+                                    <circle
+                                      cx={anchor.handleIn[0]}
+                                      cy={anchor.handleIn[1]}
+                                      r={hitRadius}
+                                      fill="transparent"
+                                      className="cursor-pointer pointer-events-auto"
+                                      onMouseDown={(e) => handleHandleMouseDown(e, idx, "handleIn")}
+                                    />
+                                    {/* Visible blue handle dot */}
                                     <circle
                                       cx={anchor.handleIn[0]}
                                       cy={anchor.handleIn[1]}
                                       r={handleRadius}
-                                      fill="#38bdf8"
+                                      fill="#0284c7"
                                       stroke="#ffffff"
-                                      strokeWidth={screenScale}
-                                      className="cursor-crosshair pointer-events-auto shadow-sm"
-                                      onMouseDown={(e) => {
-                                        e.stopPropagation();
-                                        e.preventDefault();
-                                        const pt = getSvgPoint(e);
-                                        if (!pt) return;
-                                        penDragRef.current = {
-                                          active: true,
-                                          anchorIndex: idx,
-                                          dragType: "move-handle-in",
-                                          startX: pt[0],
-                                          startY: pt[1],
-                                        };
-                                      }}
+                                      strokeWidth={Math.max(1.5, 2 * screenScale)}
+                                      className="pointer-events-none drop-shadow-md"
                                     />
-                                  </>
+                                  </g>
                                 )}
 
                                 {/* Anchor Vertex Node (Square or Snapping Circle) */}
@@ -1274,7 +1491,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                   <circle
                                     cx={anchor.x}
                                     cy={anchor.y}
-                                    r={ptSize * 1.25}
+                                    r={ptSize * 1.3}
                                     fill="#10b981"
                                     stroke="#ffffff"
                                     strokeWidth={Math.max(1.5, 2 * screenScale)}
@@ -1282,35 +1499,34 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                     onMouseDown={(e) => {
                                       e.stopPropagation();
                                       e.preventDefault();
-                                      finishPenPath();
+                                      setIsPathClosed(true);
+                                      setIsNearStartPoint(false);
                                     }}
                                   />
                                 ) : (
-                                  <rect
-                                    x={anchor.x - halfPt}
-                                    y={anchor.y - halfPt}
-                                    width={ptSize}
-                                    height={ptSize}
-                                    rx={1.5 * screenScale}
-                                    fill={isStart ? "#f59e0b" : "#ffffff"}
-                                    stroke="#171717"
-                                    strokeWidth={Math.max(1, 1.2 * screenScale)}
-                                    className="cursor-move pointer-events-auto shadow-xs"
-                                    onMouseDown={(e) => {
-                                      e.stopPropagation();
-                                      e.preventDefault();
-                                      const pt = getSvgPoint(e);
-                                      if (!pt) return;
-                                      penDragRef.current = {
-                                        active: true,
-                                        anchorIndex: idx,
-                                        dragType: "move-anchor",
-                                        startX: pt[0],
-                                        startY: pt[1],
-                                        initialAnchor: { ...anchor },
-                                      };
-                                    }}
-                                  />
+                                  <g className="anchor-node-group">
+                                    {/* Generous invisible hit target for anchor */}
+                                    <circle
+                                      cx={anchor.x}
+                                      cy={anchor.y}
+                                      r={hitRadius}
+                                      fill="transparent"
+                                      className="cursor-move pointer-events-auto"
+                                      onMouseDown={(e) => handleAnchorMouseDown(e, idx)}
+                                    />
+                                    {/* Visible Anchor Square */}
+                                    <rect
+                                      x={anchor.x - halfPt}
+                                      y={anchor.y - halfPt}
+                                      width={ptSize}
+                                      height={ptSize}
+                                      rx={1.5 * screenScale}
+                                      fill={isStart ? "#f59e0b" : "#ffffff"}
+                                      stroke="#171717"
+                                      strokeWidth={Math.max(1, 1.5 * screenScale)}
+                                      className="pointer-events-none shadow-xs"
+                                    />
+                                  </g>
                                 )}
                               </g>
                             );
@@ -1325,33 +1541,89 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                 {trayState.activeTool === "pen" && (
                   <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 backdrop-blur-md px-4 py-2 rounded-xl border border-amber-500/50 shadow-2xl flex items-center gap-3 text-xs text-neutral-200">
                     <div className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-ping" />
-                    <span className="font-medium">
-                      Pen Tool: Click & hold-drag to curve Slot #{trayState.selectedSlot} ({penAnchors.length} points)
-                    </span>
-                    <span className="text-neutral-500">|</span>
+                    <div className="flex flex-col">
+                      <span className="font-semibold text-neutral-100 flex items-center gap-1.5">
+                        <span>Pen Tool: Slot #{trayState.selectedSlot}</span>
+                        {isPathClosed && (
+                          <span className="px-1.5 py-0.2 bg-emerald-500/20 text-emerald-400 text-[10px] rounded font-bold border border-emerald-500/40">
+                            Closed Loop (Editable)
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-[10px] text-neutral-400">
+                        {isPathClosed
+                          ? "Drag points or blue handles to tweak curves. Hold Alt to break curve angle."
+                          : "Click & hold-drag to curve. Hold Alt to break handles. Click start point to close loop."}
+                      </span>
+                    </div>
+
+                    <div className="h-6 w-px bg-neutral-800" />
+
+                    {/* Convert Auto-Detection Button (if empty) */}
+                    {penAnchors.length === 0 && (
+                      <button
+                        onClick={handleConvertAutoToPen}
+                        className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-amber-300 rounded text-[11px] font-medium flex items-center gap-1 cursor-pointer transition-all border border-neutral-700 hover:border-amber-500/50"
+                        title="Generate 6 editable Bezier curve anchors from current nail detection"
+                      >
+                        <Wand2 className="w-3 h-3 text-amber-400" />
+                        <span>Convert to Bezier</span>
+                      </button>
+                    )}
+
+                    {/* Close Path button (if >= 3 points and open) */}
+                    {!isPathClosed && penAnchors.length >= 3 && (
+                      <button
+                        onClick={() => setIsPathClosed(true)}
+                        className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded text-[11px] font-medium flex items-center gap-1 cursor-pointer transition-all border border-amber-500/40"
+                        title="Close path loop to preview and adjust the complete shape"
+                      >
+                        <Check className="w-3 h-3" />
+                        <span>Close Loop</span>
+                      </button>
+                    )}
+
+                    {/* Re-open button (if closed) */}
+                    {isPathClosed && (
+                      <button
+                        onClick={() => setIsPathClosed(false)}
+                        className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                        title="Re-open loop to add more points"
+                      >
+                        <span>Re-open</span>
+                      </button>
+                    )}
+
+                    {/* Save & Apply Button */}
                     <button
                       onClick={finishPenPath}
                       disabled={penAnchors.length < 3}
-                      className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-neutral-950 rounded font-semibold text-[11px] flex items-center gap-1 cursor-pointer transition-all"
+                      className="px-3 py-1 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-neutral-950 rounded-lg font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition-all shadow-md"
+                      title="Save contour to nail and update preview (Enter)"
                     >
-                      <Check className="w-3 h-3" />
-                      <span>Complete Path (Enter)</span>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Save to Nail (Enter)</span>
                     </button>
+
+                    {/* Undo Point (Ctrl+Z) */}
                     {penAnchors.length > 0 && (
                       <button
                         onClick={undoLastPenPoint}
-                        className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                        className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                        title="Undo last point / re-open (Ctrl+Z)"
                       >
                         <Undo2 className="w-3 h-3" />
-                        <span>Undo Point</span>
+                        <span>Undo (Ctrl+Z)</span>
                       </button>
                     )}
+
+                    {/* Cancel Button */}
                     <button
                       onClick={cancelPenDrawing}
-                      className="p-1 hover:text-rose-400 text-neutral-400 cursor-pointer"
-                      title="Cancel (Esc)"
+                      className="p-1.5 hover:text-rose-400 text-neutral-400 cursor-pointer"
+                      title="Exit Pen Tool (Esc)"
                     >
-                      <X className="w-3.5 h-3.5" />
+                      <X className="w-4 h-4" />
                     </button>
                   </div>
                 )}
