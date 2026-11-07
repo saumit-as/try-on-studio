@@ -26,7 +26,7 @@ import {
   Check,
   X,
 } from "lucide-react";
-import { ActiveTab, TrayState, DetectedSlot, FingerName } from "../../types";
+import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor } from "../../types";
 import { callSidecar } from "../../services/sidecar";
 
 interface CanvasViewportProps {
@@ -58,6 +58,65 @@ interface DragState {
   origContour: [number, number][];
 }
 
+// Sample cubic Bezier curve segment into discrete points for OpenCV contour
+function sampleCubicBezier(
+  p0: [number, number],
+  c1: [number, number],
+  c2: [number, number],
+  p1: [number, number],
+  steps: number = 16
+): [number, number][] {
+  const pts: [number, number][] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const mt = 1 - t;
+    const mt2 = mt * mt;
+    const t2 = t * t;
+    const x =
+      mt2 * mt * p0[0] +
+      3 * mt2 * t * c1[0] +
+      3 * mt * t2 * c2[0] +
+      t2 * t * p1[0];
+    const y =
+      mt2 * mt * p0[1] +
+      3 * mt2 * t * c1[1] +
+      3 * mt * t2 * c2[1] +
+      t2 * t * p1[1];
+    pts.push([Math.round(x), Math.round(y)]);
+  }
+  return pts;
+}
+
+// Construct SVG cubic Bezier path 'd' string
+function constructPathD(
+  anchors: PenAnchor[],
+  closed: boolean,
+  mousePos: [number, number] | null,
+  isNearStart: boolean
+): string {
+  if (anchors.length === 0) return "";
+  let d = `M ${anchors[0].x} ${anchors[0].y}`;
+  for (let i = 1; i < anchors.length; i++) {
+    const prev = anchors[i - 1];
+    const curr = anchors[i];
+    d += ` C ${prev.handleOut[0]} ${prev.handleOut[1]}, ${curr.handleIn[0]} ${curr.handleIn[1]}, ${curr.x} ${curr.y}`;
+  }
+  if (closed) {
+    const last = anchors[anchors.length - 1];
+    const first = anchors[0];
+    d += ` C ${last.handleOut[0]} ${last.handleOut[1]}, ${first.handleIn[0]} ${first.handleIn[1]}, ${first.x} ${first.y} Z`;
+  } else if (mousePos) {
+    const last = anchors[anchors.length - 1];
+    if (isNearStart && anchors.length >= 3) {
+      const first = anchors[0];
+      d += ` C ${last.handleOut[0]} ${last.handleOut[1]}, ${first.handleIn[0]} ${first.handleIn[1]}, ${first.x} ${first.y}`;
+    } else {
+      d += ` C ${last.handleOut[0]} ${last.handleOut[1]}, ${mousePos[0]} ${mousePos[1]}, ${mousePos[0]} ${mousePos[1]}`;
+    }
+  }
+  return d;
+}
+
 export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   activeTab,
   trayState,
@@ -77,10 +136,18 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   const panStartRef = useRef<{ startX: number; startY: number; initPanX: number; initPanY: number } | null>(null);
   const [isSpacePressed, setIsSpacePressed] = useState<boolean>(false);
 
-  // Pen Tool Drawing State
-  const [penPoints, setPenPoints] = useState<[number, number][]>([]);
+  // Photoshop-Style Bezier Pen Tool State
+  const [penAnchors, setPenAnchors] = useState<PenAnchor[]>([]);
   const [currentMousePos, setCurrentMousePos] = useState<[number, number] | null>(null);
   const [isNearStartPoint, setIsNearStartPoint] = useState<boolean>(false);
+  const penDragRef = useRef<{
+    active: boolean;
+    anchorIndex: number;
+    dragType: "create-tangent" | "move-anchor" | "move-handle-in" | "move-handle-out";
+    startX: number;
+    startY: number;
+    initialAnchor?: PenAnchor;
+  } | null>(null);
 
   const processFile = (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -113,7 +180,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       // Reset zoom & pan on new image
       setZoom(1);
       setPan({ x: 0, y: 0 });
-      setPenPoints([]);
+      setPenAnchors([]);
 
       try {
         const res = await callSidecar<{
@@ -303,17 +370,116 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     };
   };
 
+  // SVG mouse down handler: supports hold-and-drag Photoshop-style Pen Tool curving
+  const handleSvgMouseDown = (e: ReactMouseEvent<SVGSVGElement>) => {
+    if (e.button === 1 || isSpacePressed || trayState.activeTool === "pan") {
+      e.preventDefault();
+      startPan(e.clientX, e.clientY);
+      return;
+    }
+
+    if (trayState.activeTool === "pen" && e.button === 0) {
+      e.preventDefault();
+      const pt = getSvgPoint(e);
+      if (!pt) return;
+
+      // 1. If clicking near start point and has >= 3 anchors, finish and close path!
+      if (penAnchors.length >= 3 && isNearStartPoint) {
+        finishPenPath();
+        return;
+      }
+
+      // 2. Add new anchor and start tangent handle dragging
+      const newAnchor: PenAnchor = {
+        x: Math.round(pt[0]),
+        y: Math.round(pt[1]),
+        handleIn: [Math.round(pt[0]), Math.round(pt[1])],
+        handleOut: [Math.round(pt[0]), Math.round(pt[1])],
+      };
+
+      const newIdx = penAnchors.length;
+      setPenAnchors((prev) => [...prev, newAnchor]);
+      penDragRef.current = {
+        active: true,
+        anchorIndex: newIdx,
+        dragType: "create-tangent",
+        startX: pt[0],
+        startY: pt[1],
+      };
+    }
+  };
+
   // Svg mouse move handler: handles transform drag and Pen tool preview
   const handleSvgMouseMove = (e: ReactMouseEvent<SVGSVGElement>) => {
     const pt = getSvgPoint(e);
     if (!pt) return;
 
-    // 1. Pen tool active: track live cursor and check snapping to start point
+    // 1. Pen tool active
     if (trayState.activeTool === "pen") {
       setCurrentMousePos(pt);
-      if (penPoints.length >= 3) {
-        const snapRadius = Math.max(16, (trayState.trayImageSize?.[0] || 1000) * 0.02) / zoom;
-        const d = Math.hypot(pt[0] - penPoints[0][0], pt[1] - penPoints[0][1]);
+
+      if (penDragRef.current && penDragRef.current.active) {
+        const { anchorIndex, dragType, startX, startY } = penDragRef.current;
+        const dx = pt[0] - startX;
+        const dy = pt[1] - startY;
+
+        if (dragType === "create-tangent") {
+          // Photoshop hold-and-drag: handleOut follows cursor, handleIn reflects symmetrically
+          setPenAnchors((prev) => {
+            const next = [...prev];
+            if (next[anchorIndex]) {
+              next[anchorIndex] = {
+                ...next[anchorIndex],
+                handleOut: [Math.round(startX + dx), Math.round(startY + dy)],
+                handleIn: [Math.round(startX - dx), Math.round(startY - dy)],
+              };
+            }
+            return next;
+          });
+        } else if (dragType === "move-handle-out") {
+          setPenAnchors((prev) => {
+            const next = [...prev];
+            if (next[anchorIndex]) {
+              next[anchorIndex] = {
+                ...next[anchorIndex],
+                handleOut: [Math.round(pt[0]), Math.round(pt[1])],
+              };
+            }
+            return next;
+          });
+        } else if (dragType === "move-handle-in") {
+          setPenAnchors((prev) => {
+            const next = [...prev];
+            if (next[anchorIndex]) {
+              next[anchorIndex] = {
+                ...next[anchorIndex],
+                handleIn: [Math.round(pt[0]), Math.round(pt[1])],
+              };
+            }
+            return next;
+          });
+        } else if (dragType === "move-anchor" && penDragRef.current.initialAnchor) {
+          const init = penDragRef.current.initialAnchor;
+          setPenAnchors((prev) => {
+            const next = [...prev];
+            if (next[anchorIndex]) {
+              next[anchorIndex] = {
+                x: Math.round(init.x + dx),
+                y: Math.round(init.y + dy),
+                handleIn: [Math.round(init.handleIn[0] + dx), Math.round(init.handleIn[1] + dy)],
+                handleOut: [Math.round(init.handleOut[0] + dx), Math.round(init.handleOut[1] + dy)],
+              };
+            }
+            return next;
+          });
+        }
+        return;
+      }
+
+      // Check snapping to start point
+      if (penAnchors.length >= 3) {
+        const snapRadius = Math.max(14, 22 / Math.max(0.3, zoom));
+        const d = Math.hypot(pt[0] - penAnchors[0].x, pt[1] - penAnchors[0].y);
         setIsNearStartPoint(d <= snapRadius);
       } else {
         setIsNearStartPoint(false);
@@ -426,27 +592,59 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
     }
   };
 
-  // Pen tool point click handler
-  const handleSvgClick = (e: ReactMouseEvent<SVGSVGElement>) => {
-    if (trayState.activeTool !== "pen") return;
-    const pt = getSvgPoint(e);
-    if (!pt) return;
-
-    // Check if clicking near first point to close path
-    if (penPoints.length >= 3 && isNearStartPoint) {
-      finishPenPath();
-      return;
+  // SVG mouse up handler: commits handle curving or finishes drag
+  const handleSvgMouseUp = (e: ReactMouseEvent<SVGSVGElement>) => {
+    if (trayState.activeTool === "pen") {
+      if (penDragRef.current && penDragRef.current.active) {
+        const pt = getSvgPoint(e);
+        if (pt && penDragRef.current.dragType === "create-tangent") {
+          const { anchorIndex, startX, startY } = penDragRef.current;
+          const dist = Math.hypot(pt[0] - startX, pt[1] - startY);
+          // If clicked and released with minimal drag (< 4px screen equivalent), treat as sharp corner
+          if (dist < 4 / Math.max(0.3, zoom)) {
+            setPenAnchors((prev) => {
+              const next = [...prev];
+              if (next[anchorIndex]) {
+                next[anchorIndex] = {
+                  ...next[anchorIndex],
+                  handleIn: [next[anchorIndex].x, next[anchorIndex].y],
+                  handleOut: [next[anchorIndex].x, next[anchorIndex].y],
+                };
+              }
+              return next;
+            });
+          }
+        }
+        penDragRef.current = null;
+      }
     }
-
-    setPenPoints((prev) => [...prev, [Math.round(pt[0]), Math.round(pt[1])]]);
+    endDrag();
   };
 
-  // Complete and apply custom pen drawn contour
+  // Complete and apply custom pen drawn curved contour
   const finishPenPath = () => {
-    if (penPoints.length < 3) return;
+    if (penAnchors.length < 3) return;
 
-    const xs = penPoints.map((p) => p[0]);
-    const ys = penPoints.map((p) => p[1]);
+    // Sample all cubic Bezier segments into dense polygon contour
+    const denseContour: [number, number][] = [];
+    for (let i = 0; i < penAnchors.length; i++) {
+      const curr = penAnchors[i];
+      const next = penAnchors[(i + 1) % penAnchors.length];
+      const segment = sampleCubicBezier(
+        [curr.x, curr.y],
+        curr.handleOut,
+        next.handleIn,
+        [next.x, next.y],
+        16
+      );
+      // Exclude the last point of each segment to avoid duplicate with the start of next
+      denseContour.push(...segment.slice(0, -1));
+    }
+
+    if (denseContour.length < 3) return;
+
+    const xs = denseContour.map((p) => p[0]);
+    const ys = denseContour.map((p) => p[1]);
     const minX = Math.round(Math.min(...xs));
     const minY = Math.round(Math.min(...ys));
     const maxX = Math.round(Math.max(...xs));
@@ -461,7 +659,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           ? {
               ...s,
               bbox: newBbox,
-              contour: penPoints,
+              contour: denseContour,
             }
           : s
       );
@@ -482,20 +680,22 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       };
     });
 
-    setPenPoints([]);
+    setPenAnchors([]);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
+    penDragRef.current = null;
   };
 
   const cancelPenDrawing = () => {
-    setPenPoints([]);
+    setPenAnchors([]);
     setCurrentMousePos(null);
     setIsNearStartPoint(false);
+    penDragRef.current = null;
     setTrayState((prev) => ({ ...prev, activeTool: "select" }));
   };
 
   const undoLastPenPoint = () => {
-    setPenPoints((prev) => prev.slice(0, -1));
+    setPenAnchors((prev) => prev.slice(0, -1));
   };
 
   const endDrag = () => {
@@ -528,21 +728,21 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       if (e.code === "Space" && !e.repeat) {
         setIsSpacePressed(true);
       } else if (e.key === "p" || e.key === "P") {
-        setTrayState((prev) => ({ ...prev, activeTool: "pen" }));
+        setTrayState((prev) => ({ ...prev, activeTool: "pen", isManualEditMode: false }));
       } else if (e.key === "v" || e.key === "V") {
         setTrayState((prev) => ({ ...prev, activeTool: "select" }));
       } else if (e.key === "h" || e.key === "H") {
         setTrayState((prev) => ({ ...prev, activeTool: "pan" }));
       } else if (e.key === "Escape") {
-        if (penPoints.length > 0) {
+        if (penAnchors.length > 0) {
           cancelPenDrawing();
         }
       } else if (e.key === "Backspace" || e.key === "Delete") {
-        if (penPoints.length > 0) {
+        if (penAnchors.length > 0) {
           undoLastPenPoint();
         }
       } else if (e.key === "Enter") {
-        if (penPoints.length >= 3) {
+        if (penAnchors.length >= 3) {
           finishPenPath();
         }
       }
@@ -560,7 +760,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [penPoints, setTrayState]);
+  }, [penAnchors, setTrayState]);
 
   // Global mouse listeners for panning and ending drags outside the SVG
   useEffect(() => {
@@ -706,14 +906,20 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                       className="absolute inset-0 w-full h-full select-none"
                       viewBox={`0 0 ${trayState.trayImageSize[0]} ${trayState.trayImageSize[1]}`}
                       preserveAspectRatio="xMidYMid meet"
-                      onClick={handleSvgClick}
+                      onMouseDown={handleSvgMouseDown}
                       onMouseMove={handleSvgMouseMove}
-                      onMouseUp={endDrag}
+                      onMouseUp={handleSvgMouseUp}
                     >
                       {/* Detected Slot Contours */}
                       {trayState.detectedSlots.map((slot, index) => {
                         const isSelected = trayState.selectedSlot === slot.slot_id;
                         const isHovered = trayState.hoveredSlot === slot.slot_id;
+
+                        // When Pen Tool is active: HIDE ALL OTHER SLOTS to completely remove visual clutter!
+                        if (trayState.activeTool === "pen" && !isSelected) {
+                          return null;
+                        }
+
                         const color = SLOT_PALETTE[index % SLOT_PALETTE.length];
                         const pointsString = slot.contour
                           .map((pt) => `${pt[0]},${pt[1]}`)
@@ -724,10 +930,9 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                         const centerY = by + bh / 2;
                         const assignedFinger = trayState.slotFinger[slot.slot_id];
 
-                        const handleSize = Math.max(
-                          10,
-                          Math.round((trayState.trayImageSize?.[0] || 1500) * 0.01)
-                        );
+                        // Scale handles inversely with zoom so they remain a constant ~10-14 screen pixels
+                        const screenScale = 1 / Math.max(0.2, zoom);
+                        const handleSize = Math.max(8, 14 * screenScale);
                         const halfHandle = handleSize / 2;
 
                         let cuticleIdx = 0;
@@ -767,47 +972,68 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                             } transition-all`}
                           >
                             {/* Contour Polygon */}
-                            <polygon
-                              points={pointsString}
-                              fill={
-                                isSelected
-                                  ? "rgba(245, 158, 11, 0.38)"
-                                  : isHovered
-                                  ? "rgba(245, 158, 11, 0.22)"
-                                  : "rgba(0, 0, 0, 0.15)"
-                              }
-                              stroke={isSelected ? "#f59e0b" : isHovered ? "#fbbf24" : color}
-                              strokeWidth={isSelected ? 3.5 : isHovered ? 3 : 2}
-                              strokeLinejoin="round"
-                              className="transition-all"
-                            />
-
-                            {/* Center Number & Finger Badge */}
-                            <g transform={`translate(${centerX}, ${centerY})`}>
-                              <rect
-                                x="-24"
-                                y="-12"
-                                width="48"
-                                height="24"
-                                rx="12"
-                                fill={isSelected ? "#f59e0b" : "#171717"}
-                                stroke={isSelected ? "#ffffff" : color}
-                                strokeWidth="1.5"
-                                className="shadow-md"
+                            {trayState.activeTool === "pen" ? (
+                              penAnchors.length === 0 ? (
+                                <polygon
+                                  points={pointsString}
+                                  fill="none"
+                                  stroke="rgba(245, 158, 11, 0.45)"
+                                  strokeWidth={Math.max(1, 1.5 * screenScale)}
+                                  strokeDasharray={`${Math.max(4, 6 * screenScale)},${Math.max(3, 4 * screenScale)}`}
+                                  className="pointer-events-none"
+                                />
+                              ) : null
+                            ) : (
+                              <polygon
+                                points={pointsString}
+                                fill={
+                                  isSelected
+                                    ? "rgba(245, 158, 11, 0.38)"
+                                    : isHovered
+                                    ? "rgba(245, 158, 11, 0.22)"
+                                    : "rgba(0, 0, 0, 0.15)"
+                                }
+                                stroke={isSelected ? "#f59e0b" : isHovered ? "#fbbf24" : color}
+                                strokeWidth={
+                                  isSelected
+                                    ? Math.max(2, 3.5 * screenScale)
+                                    : isHovered
+                                    ? Math.max(1.5, 3 * screenScale)
+                                    : Math.max(1, 2 * screenScale)
+                                }
+                                strokeLinejoin="round"
+                                className="transition-all"
                               />
-                              <text
-                                textAnchor="middle"
-                                dominantBaseline="central"
-                                fill={isSelected ? "#000000" : "#ffffff"}
-                                fontSize="10"
-                                fontWeight="bold"
-                                fontFamily="sans-serif"
-                              >
-                                {assignedFinger ? assignedFinger[0] : `#${slot.slot_id}`}
-                              </text>
-                            </g>
+                            )}
 
-                            {/* Manual Selection Bounding Box & Handles */}
+                            {/* Center Number & Finger Badge: Hide when Pen Tool is active */}
+                            {trayState.activeTool !== "pen" && (
+                              <g transform={`translate(${centerX}, ${centerY})`}>
+                                <rect
+                                  x={-18 * screenScale}
+                                  y={-9 * screenScale}
+                                  width={36 * screenScale}
+                                  height={18 * screenScale}
+                                  rx={9 * screenScale}
+                                  fill={isSelected ? "#f59e0b" : "#171717"}
+                                  stroke={isSelected ? "#ffffff" : color}
+                                  strokeWidth={1.2 * screenScale}
+                                  className="shadow-md"
+                                />
+                                <text
+                                  textAnchor="middle"
+                                  dominantBaseline="central"
+                                  fill={isSelected ? "#000000" : "#ffffff"}
+                                  fontSize={Math.max(8, 9 * screenScale)}
+                                  fontWeight="bold"
+                                  fontFamily="sans-serif"
+                                >
+                                  {assignedFinger ? assignedFinger[0] : `#${slot.slot_id}`}
+                                </text>
+                              </g>
+                            )}
+
+                            {/* Manual Selection Bounding Box & Handles: NEVER show when activeTool === "pen" */}
                             {trayState.isManualEditMode &&
                               isSelected &&
                               trayState.activeTool !== "pen" && (
@@ -819,31 +1045,31 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                     height={bh}
                                     fill="rgba(245, 158, 11, 0.05)"
                                     stroke="#f59e0b"
-                                    strokeWidth="2"
-                                    strokeDasharray="6,4"
+                                    strokeWidth={1.5 * screenScale}
+                                    strokeDasharray={`${Math.max(4, 6 * screenScale)},${Math.max(3, 4 * screenScale)}`}
                                     className="pointer-events-none"
                                   />
 
                                   <g
-                                    transform={`translate(${centerX}, ${by - 18})`}
+                                    transform={`translate(${centerX}, ${by - 14 * screenScale})`}
                                     onMouseDown={(e) => startDrag(e, "move")}
                                     className="cursor-move"
                                   >
                                     <rect
-                                      x="-28"
-                                      y="-9"
-                                      width="56"
-                                      height="18"
-                                      rx="9"
+                                      x={-22 * screenScale}
+                                      y={-7 * screenScale}
+                                      width={44 * screenScale}
+                                      height={14 * screenScale}
+                                      rx={7 * screenScale}
                                       fill="#f59e0b"
                                       stroke="#ffffff"
-                                      strokeWidth="1.5"
+                                      strokeWidth={screenScale}
                                     />
                                     <text
                                       textAnchor="middle"
                                       dominantBaseline="central"
                                       fill="#000000"
-                                      fontSize="9"
+                                      fontSize={Math.max(7, 8 * screenScale)}
                                       fontWeight="bold"
                                       fontFamily="sans-serif"
                                     >
@@ -867,10 +1093,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                       y={h.y - halfHandle}
                                       width={handleSize}
                                       height={handleSize}
-                                      rx="2.5"
+                                      rx={2 * screenScale}
                                       fill="#f59e0b"
                                       stroke="#ffffff"
-                                      strokeWidth="1.5"
+                                      strokeWidth={screenScale}
                                       style={{ cursor: h.cursor }}
                                       onMouseDown={(e) => startDrag(e, "resize", h.id)}
                                     />
@@ -889,10 +1115,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                                         key={lm.name}
                                         cx={pt[0]}
                                         cy={pt[1]}
-                                        r={handleSize * 0.65}
+                                        r={handleSize * 0.55}
                                         fill="#06b6d4"
                                         stroke="#ffffff"
-                                        strokeWidth="2"
+                                        strokeWidth={1.5 * screenScale}
                                         className="cursor-crosshair shadow-sm hover:scale-125 transition-transform"
                                         onMouseDown={(e) =>
                                           startDrag(e, "landmark", undefined, lm.idx)
@@ -906,70 +1132,187 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                         );
                       })}
 
-                      {/* Pen Tool Interactive Path Rendering */}
-                      {penPoints.length > 0 && (
-                        <g className="pen-tool-layer pointer-events-none">
-                          {/* Closed/filled preview polygon if >= 3 points */}
-                          {penPoints.length >= 3 && (
-                            <polygon
-                              points={penPoints.map((pt) => `${pt[0]},${pt[1]}`).join(" ")}
-                              fill="rgba(245, 158, 11, 0.20)"
-                              stroke="none"
+                      {/* Photoshop-Style Bezier Pen Tool Layer */}
+                      {trayState.activeTool === "pen" && (
+                        <g className="pen-tool-bezier-layer">
+                          {/* Dynamic Cubic Bezier Spline Path */}
+                          {penAnchors.length > 0 && (
+                            <path
+                              d={constructPathD(penAnchors, false, null, false)}
+                              fill={penAnchors.length >= 3 ? "rgba(245, 158, 11, 0.22)" : "none"}
+                              stroke="#f59e0b"
+                              strokeWidth={Math.max(1.5, 2.5 / Math.max(0.3, zoom))}
+                              strokeLinejoin="round"
+                              strokeLinecap="round"
+                              className="pointer-events-none"
                             />
                           )}
 
-                          {/* Polyline connecting placed points */}
-                          <polyline
-                            points={penPoints.map((pt) => `${pt[0]},${pt[1]}`).join(" ")}
-                            fill="none"
-                            stroke="#f59e0b"
-                            strokeWidth="3"
-                            strokeLinejoin="round"
-                            strokeLinecap="round"
-                          />
-
-                          {/* Elastic dashed preview line to current cursor */}
-                          {currentMousePos && (
-                            <line
-                              x1={penPoints[penPoints.length - 1][0]}
-                              y1={penPoints[penPoints.length - 1][1]}
-                              x2={
-                                isNearStartPoint ? penPoints[0][0] : currentMousePos[0]
-                              }
-                              y2={
-                                isNearStartPoint ? penPoints[0][1] : currentMousePos[1]
-                              }
-                              stroke={isNearStartPoint ? "#10b981" : "#f59e0b"}
-                              strokeWidth="2.5"
-                              strokeDasharray="6,4"
+                          {/* Live Rubberband Bezier Curve to Cursor */}
+                          {penAnchors.length > 0 && currentMousePos && !penDragRef.current?.active && (
+                            <path
+                              d={`M ${penAnchors[penAnchors.length - 1].x} ${
+                                penAnchors[penAnchors.length - 1].y
+                              } C ${penAnchors[penAnchors.length - 1].handleOut[0]} ${
+                                penAnchors[penAnchors.length - 1].handleOut[1]
+                              }, ${
+                                isNearStartPoint && penAnchors.length >= 3
+                                  ? penAnchors[0].x
+                                  : currentMousePos[0]
+                              } ${
+                                isNearStartPoint && penAnchors.length >= 3
+                                  ? penAnchors[0].y
+                                  : currentMousePos[1]
+                              }, ${
+                                isNearStartPoint && penAnchors.length >= 3
+                                  ? penAnchors[0].x
+                                  : currentMousePos[0]
+                              } ${
+                                isNearStartPoint && penAnchors.length >= 3
+                                  ? penAnchors[0].y
+                                  : currentMousePos[1]
+                              }`}
+                              fill="none"
+                              stroke={isNearStartPoint && penAnchors.length >= 3 ? "#10b981" : "#f59e0b"}
+                              strokeWidth={Math.max(1.5, 2 / Math.max(0.3, zoom))}
+                              strokeDasharray={`${Math.max(4, 6 / Math.max(0.3, zoom))},${Math.max(3, 4 / Math.max(0.3, zoom))}`}
+                              className="pointer-events-none"
                             />
                           )}
 
-                          {/* Placed vertex circles */}
-                          {penPoints.map((pt, idx) => {
+                          {/* Tangent Handles and Anchor Points */}
+                          {penAnchors.map((anchor, idx) => {
+                            const screenScale = 1 / Math.max(0.2, zoom);
+                            const ptSize = Math.max(5, 8 * screenScale);
+                            const halfPt = ptSize / 2;
+                            const handleRadius = Math.max(3, 5 * screenScale);
                             const isStart = idx === 0;
-                            const isSnapping = isStart && isNearStartPoint;
+                            const isSnapping = isStart && isNearStartPoint && penAnchors.length >= 3;
+                            const hasOutHandle =
+                              Math.hypot(anchor.handleOut[0] - anchor.x, anchor.handleOut[1] - anchor.y) > 1.5;
+                            const hasInHandle =
+                              Math.hypot(anchor.handleIn[0] - anchor.x, anchor.handleIn[1] - anchor.y) > 1.5;
+
                             return (
-                              <circle
-                                key={idx}
-                                cx={pt[0]}
-                                cy={pt[1]}
-                                r={
-                                  isSnapping
-                                    ? 8
-                                    : Math.max(
-                                        4,
-                                        Math.round(
-                                          (trayState.trayImageSize?.[0] || 1500) *
-                                            0.005
-                                        )
-                                      )
-                                }
-                                fill={isSnapping ? "#10b981" : isStart ? "#f59e0b" : "#ffffff"}
-                                stroke={isSnapping ? "#ffffff" : "#171717"}
-                                strokeWidth="2"
-                                className={isSnapping ? "animate-pulse" : ""}
-                              />
+                              <g key={idx}>
+                                {/* Outgoing Tangent Bar & Handle Dot */}
+                                {hasOutHandle && (
+                                  <>
+                                    <line
+                                      x1={anchor.x}
+                                      y1={anchor.y}
+                                      x2={anchor.handleOut[0]}
+                                      y2={anchor.handleOut[1]}
+                                      stroke="#38bdf8"
+                                      strokeWidth={Math.max(1, 1.2 * screenScale)}
+                                      className="pointer-events-none"
+                                    />
+                                    <circle
+                                      cx={anchor.handleOut[0]}
+                                      cy={anchor.handleOut[1]}
+                                      r={handleRadius}
+                                      fill="#38bdf8"
+                                      stroke="#ffffff"
+                                      strokeWidth={screenScale}
+                                      className="cursor-crosshair pointer-events-auto shadow-sm"
+                                      onMouseDown={(e) => {
+                                        e.stopPropagation();
+                                        e.preventDefault();
+                                        const pt = getSvgPoint(e);
+                                        if (!pt) return;
+                                        penDragRef.current = {
+                                          active: true,
+                                          anchorIndex: idx,
+                                          dragType: "move-handle-out",
+                                          startX: pt[0],
+                                          startY: pt[1],
+                                        };
+                                      }}
+                                    />
+                                  </>
+                                )}
+
+                                {/* Incoming Tangent Bar & Handle Dot */}
+                                {hasInHandle && (
+                                  <>
+                                    <line
+                                      x1={anchor.x}
+                                      y1={anchor.y}
+                                      x2={anchor.handleIn[0]}
+                                      y2={anchor.handleIn[1]}
+                                      stroke="#38bdf8"
+                                      strokeWidth={Math.max(1, 1.2 * screenScale)}
+                                      className="pointer-events-none"
+                                    />
+                                    <circle
+                                      cx={anchor.handleIn[0]}
+                                      cy={anchor.handleIn[1]}
+                                      r={handleRadius}
+                                      fill="#38bdf8"
+                                      stroke="#ffffff"
+                                      strokeWidth={screenScale}
+                                      className="cursor-crosshair pointer-events-auto shadow-sm"
+                                      onMouseDown={(e) => {
+                                        e.stopPropagation();
+                                        e.preventDefault();
+                                        const pt = getSvgPoint(e);
+                                        if (!pt) return;
+                                        penDragRef.current = {
+                                          active: true,
+                                          anchorIndex: idx,
+                                          dragType: "move-handle-in",
+                                          startX: pt[0],
+                                          startY: pt[1],
+                                        };
+                                      }}
+                                    />
+                                  </>
+                                )}
+
+                                {/* Anchor Vertex Node (Square or Snapping Circle) */}
+                                {isSnapping ? (
+                                  <circle
+                                    cx={anchor.x}
+                                    cy={anchor.y}
+                                    r={ptSize * 1.25}
+                                    fill="#10b981"
+                                    stroke="#ffffff"
+                                    strokeWidth={Math.max(1.5, 2 * screenScale)}
+                                    className="animate-pulse cursor-pointer pointer-events-auto shadow-md"
+                                    onMouseDown={(e) => {
+                                      e.stopPropagation();
+                                      e.preventDefault();
+                                      finishPenPath();
+                                    }}
+                                  />
+                                ) : (
+                                  <rect
+                                    x={anchor.x - halfPt}
+                                    y={anchor.y - halfPt}
+                                    width={ptSize}
+                                    height={ptSize}
+                                    rx={1.5 * screenScale}
+                                    fill={isStart ? "#f59e0b" : "#ffffff"}
+                                    stroke="#171717"
+                                    strokeWidth={Math.max(1, 1.2 * screenScale)}
+                                    className="cursor-move pointer-events-auto shadow-xs"
+                                    onMouseDown={(e) => {
+                                      e.stopPropagation();
+                                      e.preventDefault();
+                                      const pt = getSvgPoint(e);
+                                      if (!pt) return;
+                                      penDragRef.current = {
+                                        active: true,
+                                        anchorIndex: idx,
+                                        dragType: "move-anchor",
+                                        startX: pt[0],
+                                        startY: pt[1],
+                                        initialAnchor: { ...anchor },
+                                      };
+                                    }}
+                                  />
+                                )}
+                              </g>
                             );
                           })}
                         </g>
@@ -983,21 +1326,21 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
                   <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 backdrop-blur-md px-4 py-2 rounded-xl border border-amber-500/50 shadow-2xl flex items-center gap-3 text-xs text-neutral-200">
                     <div className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-ping" />
                     <span className="font-medium">
-                      Pen Tool Active: Click around Slot #{trayState.selectedSlot} ({penPoints.length} points placed)
+                      Pen Tool: Click & hold-drag to curve Slot #{trayState.selectedSlot} ({penAnchors.length} points)
                     </span>
                     <span className="text-neutral-500">|</span>
                     <button
                       onClick={finishPenPath}
-                      disabled={penPoints.length < 3}
-                      className="px-2 py-0.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-neutral-950 rounded font-semibold text-[11px] flex items-center gap-1 cursor-pointer transition-all"
+                      disabled={penAnchors.length < 3}
+                      className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-neutral-950 rounded font-semibold text-[11px] flex items-center gap-1 cursor-pointer transition-all"
                     >
                       <Check className="w-3 h-3" />
-                      <span>Complete Path</span>
+                      <span>Complete Path (Enter)</span>
                     </button>
-                    {penPoints.length > 0 && (
+                    {penAnchors.length > 0 && (
                       <button
                         onClick={undoLastPenPoint}
-                        className="px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                        className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-[11px] flex items-center gap-1 cursor-pointer"
                       >
                         <Undo2 className="w-3 h-3" />
                         <span>Undo Point</span>
@@ -1046,14 +1389,14 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
                     <button
                       onClick={() => {
-                        setTrayState((prev) => ({ ...prev, activeTool: "pen" }));
+                        setTrayState((prev) => ({ ...prev, activeTool: "pen", isManualEditMode: false }));
                       }}
                       className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
                         trayState.activeTool === "pen"
                           ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
                           : "text-neutral-400 hover:text-neutral-200"
                       }`}
-                      title="Draw Custom Contour Pen Tool (P)"
+                      title="Draw Custom Curved Contour Pen Tool (P)"
                     >
                       <PenTool className="w-3 h-3" />
                       <span>Pen Tool</span>

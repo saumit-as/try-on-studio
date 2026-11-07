@@ -39,6 +39,13 @@ export interface LightingState {
   showAdvanced: boolean;
 }
 
+export interface PenAnchor {
+  x: number;
+  y: number;
+  handleIn: [number, number];
+  handleOut: [number, number];
+}
+
 export interface TrayState {
   trayImageSrc: string | null;
   trayImageSize: [number, number] | null;

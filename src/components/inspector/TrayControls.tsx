@@ -456,6 +456,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                   setTrayState((prev) => ({
                     ...prev,
                     activeTool: prev.activeTool === "pen" ? "select" : "pen",
+                    isManualEditMode: prev.activeTool === "pen" ? prev.isManualEditMode : false,
                   }))
                 }
                 className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
@@ -463,7 +464,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                     ? "bg-amber-500/25 border-amber-500 text-amber-300 font-semibold shadow-xs"
                     : "bg-neutral-800 hover:bg-neutral-750 border-neutral-700 text-neutral-300"
                 }`}
-                title="Draw custom nail contour with Pen Tool"
+                title="Draw custom curved nail contour with Pen Tool"
               >
                 <PenTool className="w-2.5 h-2.5" />
                 <span>{trayState.activeTool === "pen" ? "Pen: Active" : "Pen Tool"}</span>
@@ -475,6 +476,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                   setTrayState((prev) => ({
                     ...prev,
                     isManualEditMode: !prev.isManualEditMode,
+                    activeTool: !prev.isManualEditMode ? "select" : prev.activeTool,
                   }))
                 }
                 className={`px-2 py-0.5 text-[10px] font-medium rounded-md border transition-all cursor-pointer flex items-center gap-1 ${
@@ -492,10 +494,12 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
 
           <p className="text-[11px] text-neutral-400 leading-relaxed">
             {trayState.activeTool === "pen"
-              ? "Pen Tool active: click on the canvas around the nail to place points. Click first point or press Enter to finish."
+              ? "Pen Tool active: click and drag to curve around Slot #" +
+                selectedSlot +
+                ". Other boundaries are hidden to prevent clutter. Press Enter or click start point to finish."
               : isManualEditMode
               ? "Drag handles directly on the canvas to stretch, resize, or reposition the selection box."
-              : "Use the micro-nudge D-pad, dimension adjusters, or the Pen Tool to draw a custom contour."}
+              : "Use the micro-nudge D-pad, dimension adjusters, or the Pen Tool to curve custom contours."}
           </p>
 
           {/* D-Pad Micro-Nudge & Step Toggle */}
