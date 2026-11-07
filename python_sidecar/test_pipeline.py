@@ -30,6 +30,7 @@ from warping import (
     warp_nail_tps,
     build_cuticle_pocket_mask,
 )
+from compositor import recover_clean_nail_albedo, composite_nail_pbr
 
 
 def blend_nail_naturally(
@@ -112,16 +113,22 @@ def blend_nail_naturally(
     )
 
 
-def main():
+def run_tray_set(
+    tray_filename: str,
+    annotated_out_name: str,
+    nail_prefix: str,
+    composite_out_name: str,
+    relit_out_name: str,
+) -> None:
     print("=" * 70)
-    print(" PRESS-ON NAIL STUDIO - PHASE 1 PIPELINE VERIFICATION")
+    print(f" PRESS-ON NAIL STUDIO - PIPELINE RUN ({tray_filename})")
     print("=" * 70)
 
     # 1. Output directory
     output_dir = os.path.join(current_dir, "..", "test_output")
     os.makedirs(output_dir, exist_ok=True)
 
-    tray_path = os.path.join(current_dir, "..", "test_assets", "nails-sample-tray.jpg")
+    tray_path = os.path.join(current_dir, "..", "test_assets", tray_filename)
     hand_path = os.path.join(current_dir, "..", "test_assets", "hand-template.jpg")
 
     if not os.path.exists(tray_path):
@@ -179,8 +186,8 @@ def main():
         cv2.drawContours(annotated_tray, [cnt], -1, color, 3, lineType=cv2.LINE_AA)
         cv2.rectangle(annotated_tray, (x, y), (x + bw, y + bh), color, 2)
         label = f"#{sid} {shape} ({angle:+.1f}d)"
-        cv2.putText(annotated_tray, label, (x, max(25, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3)
-        cv2.putText(annotated_tray, label, (x, max(25, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2)
+        cv2.putText(annotated_tray, label, (x, max(25, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 3)
+        cv2.putText(annotated_tray, label, (x, max(25, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
         # Extract RGBA for the first 5 nails (Row 1: Thumb, Index, Middle, Ring, Pinky)
         if sid <= 5:
@@ -190,6 +197,7 @@ def main():
                 feather_px=1.5,
                 deskew=True,
                 auto_orient_cuticle_down=True,
+                force_inverted=inv,
             )
 
             extracted_nails.append({
@@ -201,10 +209,10 @@ def main():
             # Save individual upright, B-spline smoothed cutout
             finger_names = ["thumb", "index", "middle", "ring", "pinky"]
             fname = finger_names[sid - 1]
-            out_nail_path = os.path.join(output_dir, f"nail_{sid}_{fname}.png")
+            out_nail_path = os.path.join(output_dir, f"{nail_prefix}_{sid}_{fname}.png")
             cv2.imwrite(out_nail_path, nail_rgba)
 
-    tray_annotated_path = os.path.join(output_dir, "01_tray_segmented.jpg")
+    tray_annotated_path = os.path.join(output_dir, annotated_out_name)
     cv2.imwrite(tray_annotated_path, annotated_tray)
     print(f"  Saved annotated tray to: {tray_annotated_path}")
 
@@ -214,16 +222,6 @@ def main():
     h_hand, w_hand = hand_img.shape[:2]
     print(f"  Loaded hand template: {w_hand}x{h_hand} px")
 
-    # Precisely calibrated 5-finger anatomical nail-bed landmarks for test_assets/hand-template.jpg
-    # c_l, c_c, c_r trace the exact proximal cuticle skin fold (eponychium)
-    # d_l, d_r trace the exact lateral nail grooves at the free edge
-    # Note on Tray Slot Mapping (see user diagram):
-    # In the packaging tray, the 5 nails are ordered strictly by decreasing height/width:
-    #   Slot 1 (264px) -> Thumb
-    #   Slot 2 (237px) -> Middle finger (longest/widest of the 4 fingers!)
-    #   Slot 3 (235px) -> Index finger
-    #   Slot 4 (221px) -> Ring finger
-    #   Slot 5 (204px) -> Pinky finger (shortest/narrowest)
     finger_targets = [
         # 1. Thumb (Slot 1 — largest, lateral 3/4 view rotated in 3D via roll_offset=-0.35)
         {
@@ -297,24 +295,31 @@ def main():
         },
     ]
 
-    # Compute the unified Tray-to-Hand Scale Factor (`tray_to_hand_scale`) from the 4 frontal
-    # fingers (Index, Middle, Ring, Pinky) so that every nail's rendered length on the hand is
-    # strictly proportional to its extracted pixel height `src_h` in the tray image!
     hand_bed_widths = []
     tray_nail_widths = []
+    min_scale_to_cover_bed = 0.0
     for t in finger_targets[1:]:
         cw = np.linalg.norm(np.array(t["c_r"]) - np.array(t["c_l"]))
         dw = np.linalg.norm(np.array(t["d_r"]) - np.array(t["d_l"]))
-        hand_bed_widths.append(max(cw, dw))
+        bed_w = max(cw, dw)
+        distal_mid = 0.5 * (np.array(t["d_l"]) + np.array(t["d_r"]))
+        bed_len = float(np.linalg.norm(distal_mid - np.array(t["c_c"])))
+        hand_bed_widths.append(bed_w)
+
         nd = extracted_nails[t["slot_idx"]]["rgba"]
-        tray_nail_widths.append(float(nd.shape[1]))
-    # Unified scale factor mapping tray pixels -> hand pixels (calibrated to 1.15x so every nail
-    # clears the bare nail bed AND strictly preserves the 264 : 237 : 235 : 221 : 204 height ratio!)
-    tray_to_hand_scale = (sum(hand_bed_widths) / max(1.0, sum(tray_nail_widths))) * 1.15
+        xs = np.where(nd[:, :, 3] > 25)[1]
+        true_w = float(np.max(xs) - np.min(xs) + 1) if len(xs) > 0 else float(nd.shape[1])
+        tray_nail_widths.append(true_w)
+        # Ensure even shorter/squoval sets clear the bare natural nail free-edge on hand-template.jpg
+        min_scale_to_cover_bed = max(min_scale_to_cover_bed, (bed_len * 1.24) / max(1.0, float(nd.shape[0])))
+
+    width_based_scale = (sum(hand_bed_widths) / max(1.0, sum(tray_nail_widths))) * 1.05
+    tray_to_hand_scale = max(width_based_scale, min_scale_to_cover_bed)
     print(f"  Unified Tray-to-Hand Scale Factor: {tray_to_hand_scale:.3f}x")
 
     print("\n[Step 4] Executing 3-tier TPS warping, C-curve & Cuticle Skin-Fold Tuck...")
     composite_hand = hand_img.copy().astype(np.float32)
+    relit_hand = hand_img.copy().astype(np.float32)
 
     total_warp_time = 0.0
 
@@ -326,9 +331,17 @@ def main():
 
         t_w0 = time.time()
 
-        # 1. Apply transverse cylindrical barrel distortion
+        # 1. Apply transverse cylindrical barrel distortion (raw tray lighting)
         curved_nail = apply_cylindrical_c_curve(
             nail_rgba,
+            c_curve_intensity=target["c_curve"],
+            roll_offset=target.get("roll_offset", 0.0),
+        )
+
+        # 1b. Recover clean gel-polish albedo (de-glared & de-shadowed) and curve it
+        clean_albedo_rgba = recover_clean_nail_albedo(nail_rgba)
+        curved_clean_nail = apply_cylindrical_c_curve(
+            clean_albedo_rgba,
             c_curve_intensity=target["c_curve"],
             roll_offset=target.get("roll_offset", 0.0),
         )
@@ -356,6 +369,12 @@ def main():
             dst_pts,
             output_shape=(h_hand, w_hand),
         )
+        warped_clean_roi, bbox_clean = warp_nail_tps(
+            curved_clean_nail,
+            src_pts,
+            dst_pts,
+            output_shape=(h_hand, w_hand),
+        )
 
         t_w1 = time.time()
         warp_ms = (t_w1 - t_w0) * 1000
@@ -368,13 +387,21 @@ def main():
             f"ROI=({rw}x{rh}), time={warp_ms:.1f} ms"
         )
 
-        # 4. Blend warped nail naturally onto the hand with Cuticle Skin-Fold Tuck
+        # 4a. Blend warped nail (raw tray lighting)
         blend_nail_naturally(composite_hand, hand_img, warped_roi, bbox, target)
 
-    # Save final warped composite
+        # 4b. Blend studio-relit PBR nail (matched to hand-template.jpg studio lighting)
+        composite_nail_pbr(relit_hand, hand_img, warped_clean_roi, bbox_clean, target)
+
+    # Save final warped composite (raw tray lighting)
     final_composite_uint8 = np.clip(composite_hand, 0, 255).astype(np.uint8)
-    composite_out_path = os.path.join(output_dir, "02_tps_composited_hand.jpg")
+    composite_out_path = os.path.join(output_dir, composite_out_name)
     cv2.imwrite(composite_out_path, final_composite_uint8)
+
+    # Save studio-relit PBR composite
+    final_relit_uint8 = np.clip(relit_hand, 0, 255).astype(np.uint8)
+    relit_out_path = os.path.join(output_dir, relit_out_name)
+    cv2.imwrite(relit_out_path, final_relit_uint8)
 
     t_total = time.time() - t0
 
@@ -386,11 +413,29 @@ def main():
     print(f"  Average TPS warp time / nail:  {total_warp_time / len(finger_targets):.1f} ms")
     print(f"\n  Output Artifacts Generated:")
     print(f"    1. Annotated Tray:     {tray_annotated_path}")
-    print(f"    2. 5 Extracted Nails:  {output_dir}/nail_1_thumb.png to nail_5_pinky.png")
+    print(f"    2. 5 Extracted Nails:  {output_dir}/{nail_prefix}_1_thumb.png to {nail_prefix}_5_pinky.png")
     print(f"    3. Warped Composite:   {composite_out_path}")
+    print(f"    4. Studio PBR Relit:   {relit_out_path}")
     print("=" * 70)
-    print(" PHASE 1 VERIFICATION COMPLETE - READY FOR USER FEEDBACK")
-    print("=" * 70)
+
+
+def main():
+    run_tray_set(
+        tray_filename="nails-sample-tray.jpg",
+        annotated_out_name="01_tray_segmented.jpg",
+        nail_prefix="nail",
+        composite_out_name="02_tps_composited_hand.jpg",
+        relit_out_name="03_studio_relit_hand.jpg",
+    )
+    french_path = os.path.join(current_dir, "..", "test_assets", "nails-french-tray.jpg")
+    if os.path.exists(french_path):
+        run_tray_set(
+            tray_filename="nails-french-tray.jpg",
+            annotated_out_name="04_french_tray_segmented.jpg",
+            nail_prefix="french_nail",
+            composite_out_name="05_french_tps_composited_hand.jpg",
+            relit_out_name="06_french_studio_relit_hand.jpg",
+        )
 
 
 if __name__ == "__main__":
