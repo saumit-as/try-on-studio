@@ -42,7 +42,7 @@ Automates the extraction of press-on nail textures from packaging tray photograp
 - [x] Automated test pipeline (`python_sidecar/test_pipeline.py`)
 - [x] 5-dimension realism scoring agent (`python_sidecar/score_realism_agent.py`) & batch harness (`python_sidecar/test_all_nails.py`)
 
-### Phase 2: Tray Extractor UI & Interactive Slot Mapping
+### Phase 2: Tray Extractor UI, Bezier Pen Tool & Design-Preserving Extraction
 - [x] Connect [`CanvasViewport.tsx`](src/components/canvas/CanvasViewport.tsx) to sidecar `segment_tray`
 - [x] Interactive SVG/Canvas contour overlays with numbered slot badges
 - [x] Drag-and-drop & native file picker photo upload with analysis loader
@@ -51,6 +51,28 @@ Automates the extraction of press-on nail textures from packaging tray photograp
 - [x] Orientation controls (180° flip toggle and fine-rotation wheel with zero reset)
 - [x] Drag-and-drop slot-to-finger assignment chips (Thumb, Index, Middle, Ring, Pinky)
 - [x] 1-Click "Auto-Map Row 1" mapping preset
+- [x] **Zoom & Pan Viewport Engine**:
+  - Smooth wheel zoom (0.3x to 6.0x) with clamp and quick zoom reset
+  - Spacebar-drag pan & Middle-mouse pan
+  - Floating HUD with slot isolation status and zoom percentage
+- [x] **Photoshop-Style Bezier Pen Tool**:
+  - Direct click & hold-and-drag Bezier anchor point placement with live symmetric tangent handles
+  - Alt-click / Alt-drag to break tangent handle angles independently
+  - Direct curve segment bending: hover any line segment to highlight and drag to bend outward
+  - Single-click line segment to insert new anchor points
+  - Double-click any anchor to toggle between smooth Bezier curves and sharp corners
+  - Floating action banner with "Curve Point" / "Make Corner" and "Delete Point" buttons
+  - Full curve control on closing point (Anchor 0) and the final closing segment
+  - Undo/re-open via <kbd>Ctrl+Z</kbd> / <kbd>Cmd+Z</kbd> and <kbd>Backspace</kbd> / <kbd>Delete</kbd>
+  - Boundary isolation: hides all other 14 slots when Pen Tool is active for clutter-free precision
+  - Persistent per-slot Pen Anchor patterns (`slotPenAnchors`) retained across slot switching
+- [x] **High-Resolution Cutout Inspection Modal**:
+  - Click-to-open enlarged inspection modal with checkerboard transparency background
+  - 1x, 2x, 3x zoom toggles to inspect fine edge quality and transparency
+  - 1-click trim shortcuts: "Edit with Pen Tool", "Adjust Handles", "180° Flip", and "Re-extract"
+- [x] **Non-Destructive Design-Preserving Extraction (`exact_mask=True`)**:
+  - Python sidecar preserves 100% of custom drawn boundaries without destructive color-filtering
+  - Full support for dark French tips, black gothic polish, glitter, and intricate nail art without tip erosion or clipping
 
 ### Phase 3: Hand Template Authoring Wizard & Master Hand
 - [x] Bundled master studio hand photo (`test_assets/hand-template.jpg`) at 1536×2752

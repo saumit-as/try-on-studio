@@ -61,9 +61,9 @@ This roadmap breaks down the full Try-On Studio architecture into **5 sequential
 
 ---
 
-## Phase 2: Tray Extractor UI & Interactive Slot Mapping — [COMPLETED ✅]
+## Phase 2: Tray Extractor UI, Bezier Pen Tool & Design-Preserving Extraction — [COMPLETED ✅]
 
-> **Objective:** Connect the React frontend to the sidecar's segmentation engine so users can upload photos, inspect detected nails, and assign them to fingers.
+> **Objective:** Connect the React frontend to the sidecar's segmentation engine so users can upload photos, inspect detected nails, and assign them to fingers, equipped with Photoshop-grade manual vector curve editing and non-destructive extraction.
 
 ### Tasks
 - [x] Implement image file picker & drag-and-drop upload in [`CanvasViewport.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/canvas/CanvasViewport.tsx).
@@ -76,13 +76,36 @@ This roadmap breaks down the full Try-On Studio architecture into **5 sequential
 - [x] Wire orientation controls:
   - [x] 180° flip (swaps cuticle and tip).
   - [x] Fine-rotation slider (-45° to +45°).
-- [x] Wire Slot-to-Finger chip assignment (Thumb, Index, Middle, Ring, Pinky).
+- [x] Wire Slot-to-Finger chip assignment (Thumb, Index, Middle, Ring, Pinky) with 1-Click "Auto-Map Row 1".
+- [x] **Zoom & Pan Viewport Engine**:
+  - [x] Smooth mouse wheel zoom (0.3x to 6.0x) clamped with zero-distortion matrix projection.
+  - [x] Spacebar-drag panning and middle-click drag navigation.
+  - [x] Floating bottom toolbar with zoom in/out, fit-to-screen, and isolated slot counters.
+- [x] **Photoshop-Style Bezier Pen Tool**:
+  - [x] Click & hold-and-drag Bezier anchor placement with real-time symmetric blue tangent handles.
+  - [x] Alt-key curve breaking: hold Alt to adjust incoming/outgoing handle angles independently.
+  - [x] Direct curve segment bending: hover any line segment to highlight amber and drag to bend outward.
+  - [x] Click-to-insert: clicking any line segment places a new anchor point without breaking the curve.
+  - [x] Double-click toggle: double-click any anchor to switch between smooth curve and sharp corner.
+  - [x] Top banner controls: "Curve Point" / "Make Corner" toggle button and "Delete Point" button.
+  - [x] Closing loop curving: hold-and-drag on start point (Point 0) curves the final closing segment.
+  - [x] Clutter-free boundary isolation: automatically hides other 14 slots when Pen Tool is active.
+  - [x] Persistent state: custom drawn contours are saved per slot in `slotPenAnchors` across switching.
+- [x] **High-Resolution Cutout Inspection Modal**:
+  - [x] Click thumbnail in Slot Details card to open modal with transparency checkerboard background.
+  - [x] 1x, 2x, 3x zoom toggles to inspect fine edge quality and transparency.
+  - [x] Direct trim shortcuts: "Edit with Pen Tool", "Adjust Handles", "180° Flip", and "Re-extract".
+- [x] **Non-Destructive Design-Preserving Extraction (`exact_mask=True`)**:
+  - [x] Python sidecar preserves 100% of custom drawn boundaries without destructive color-filtering.
+  - [x] Full support for dark French tips, black gothic polish, glitter, and intricate nail art without tip erosion.
 
 ### 🧪 Testable Deliverable
 Launch `pnpm tauri dev`, open the **Tray Extractor** tab, upload a photo of a press-on nail packaging tray:
 1. Slots are automatically detected with colored contour overlays and classified shapes.
 2. Clicking slots 1–5 lets you reassign them to fingers.
-3. Flipping or rotating the nail updates the preview in real time.
+3. Use the Pen Tool (<kbd>P</kbd>) or Handles to modify contours, bend curves, and trim shadows.
+4. Click the thumbnail to inspect cutouts up-close with full French tip and design fidelity.
+5. Flipping or rotating the nail updates the preview in real time.
 
 > [!IMPORTANT]
 > **User Feedback Checkpoint 2**: Test various packaging types (blister packs, clear trays, glossy cards) and evaluate slot detection accuracy and manual adjustment ergonomics.
