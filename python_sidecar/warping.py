@@ -100,14 +100,31 @@ def apply_cylindrical_c_curve(
             map_x = (u_r_tex + 1.0) * 0.5 * float(w - 1)
         map_x = np.tile(map_x, (h, 1)).astype(np.float32)
 
-    warped = cv2.remap(
-        image,
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0) if has_alpha else (0, 0, 0),
-    )
+    if has_alpha:
+        warped_bgr = cv2.remap(
+            image[:, :, :3],
+            map_x.astype(np.float32),
+            map_y.astype(np.float32),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        warped_a = cv2.remap(
+            image[:, :, 3],
+            map_x.astype(np.float32),
+            map_y.astype(np.float32),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        warped = np.dstack([warped_bgr, warped_a])
+    else:
+        warped = cv2.remap(
+            image,
+            map_x.astype(np.float32),
+            map_y.astype(np.float32),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
     if has_alpha and abs(roll_offset) > 0.10:
         # Crisp 1.0px anti-aliased drop-off at the 3D silhouette horizon
         if roll_offset < 0:
@@ -424,14 +441,23 @@ def warp_nail_tps(
     map_x = mapped_src[:, 0].reshape(roi_h, roi_w).astype(np.float32)
     map_y = mapped_src[:, 1].reshape(roi_h, roi_w).astype(np.float32)
 
-    # Remap color channels with INTER_CUBIC and alpha with INTER_LINEAR for crisp, smooth edges
-    warped_roi = cv2.remap(
-        nail_rgba,
+    # Remap BGR with BORDER_REPLICATE so out-of-bounds pixels NEVER pull [0,0,0] black into the edge!
+    # Use INTER_LINEAR (not INTER_CUBIC) to prevent bicubic negative-lobe dark ringing at high-contrast edges.
+    warped_bgr = cv2.remap(
+        nail_rgba[:, :, :3],
         map_x,
         map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0, 0)
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
     )
+    warped_a = cv2.remap(
+        nail_rgba[:, :, 3],
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    warped_roi = np.dstack([warped_bgr, warped_a])
 
     return warped_roi, (min_x, min_y, roi_w, roi_h)

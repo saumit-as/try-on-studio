@@ -468,32 +468,63 @@ def deskew_nail_pca(
             new_h = int(np.ceil(h * cos_a + w * sin_a))
             img_rot_mat[0, 2] += (new_w / 2.0) - img_center[0]
             img_rot_mat[1, 2] += (new_h / 2.0) - img_center[1]
-            border_val = (0, 0, 0, 0) if image.shape[2] == 4 else (0, 0, 0)
-            deskewed_image = cv2.warpAffine(
-                image,
-                img_rot_mat,
-                (new_w, new_h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=border_val,
-            )
-            if deskewed_image.shape[2] == 4:
-                alpha = deskewed_image[:, :, 3]
-                ys, xs = np.where(alpha > 8)
+        if image.shape[2] == 4:
+            if is_local_crop:
+                bgr_warped = cv2.warpAffine(
+                    image[:, :, :3],
+                    img_rot_mat,
+                    (new_w, new_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+                alpha_warped = cv2.warpAffine(
+                    image[:, :, 3],
+                    img_rot_mat,
+                    (new_w, new_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                deskewed_image = np.dstack([bgr_warped, alpha_warped])
+                ys, xs = np.where(alpha_warped > 8)
                 if len(xs) > 0 and len(ys) > 0:
                     x0, x1 = max(0, int(np.min(xs)) - 2), min(new_w, int(np.max(xs)) + 3)
                     y0, y1 = max(0, int(np.min(ys)) - 2), min(new_h, int(np.max(ys)) + 3)
                     deskewed_image = deskewed_image[y0:y1, x0:x1]
+            else:
+                bgr_warped = cv2.warpAffine(
+                    image[:, :, :3],
+                    rot_mat,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+                alpha_warped = cv2.warpAffine(
+                    image[:, :, 3],
+                    rot_mat,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                deskewed_image = np.dstack([bgr_warped, alpha_warped])
         else:
-            border_val = (0, 0, 0, 0) if image.shape[2] == 4 else (0, 0, 0)
-            deskewed_image = cv2.warpAffine(
-                image,
-                rot_mat,
-                (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=border_val,
-            )
+            if is_local_crop:
+                deskewed_image = cv2.warpAffine(
+                    image,
+                    img_rot_mat,
+                    (new_w, new_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+            else:
+                deskewed_image = cv2.warpAffine(
+                    image,
+                    rot_mat,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
 
     return float(deskew_angle), rotated_contour, deskewed_image
 
