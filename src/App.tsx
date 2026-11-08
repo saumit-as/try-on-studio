@@ -11,6 +11,7 @@ import {
   HandState,
 } from "./types";
 import { INITIAL_DEFAULT_HAND_TEMPLATE, DEFAULT_FINGER_ADJUSTMENTS } from "./constants/handDefaults";
+import { ExportAspectRatio } from "./components/canvas/ExportCanvas";
 import "./App.css";
 
 export default function App() {
@@ -73,6 +74,9 @@ export default function App() {
     },
   });
 
+  // Phase 5: Export Aspect Ratio Framing State
+  const [exportAspectRatio, setExportAspectRatio] = useState<ExportAspectRatio>("4:5");
+
   // Check Python sidecar connection
   useEffect(() => {
     async function testConnection() {
@@ -113,6 +117,8 @@ export default function App() {
           setHandState={setHandState}
           lightingState={lightingState}
           setLightingState={setLightingState}
+          exportAspectRatio={exportAspectRatio}
+          setExportAspectRatio={setExportAspectRatio}
         />
 
         {/* Right Parameter & Tooling Inspector */}
@@ -124,6 +130,8 @@ export default function App() {
           setTrayState={setTrayState}
           handState={handState}
           setHandState={setHandState}
+          exportAspectRatio={exportAspectRatio}
+          setExportAspectRatio={setExportAspectRatio}
         />
       </div>
     </div>

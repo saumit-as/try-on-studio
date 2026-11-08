@@ -47,6 +47,7 @@ from template_generator import (
     refit_finger_landmarks,
 )
 from compositor import render_full_hand_composite
+from export import export_composite_package
 
 
 def handle_ping(params):
@@ -467,6 +468,56 @@ def handle_render_composite(params):
     }
 
 
+def handle_export_composite(params):
+    import time
+    t0 = time.time()
+
+    # 1. Load Hand Base Image
+    hand_src = params.get("hand_image_base64") or params.get("image_base64")
+    if hand_src and isinstance(hand_src, str) and hand_src.startswith("data:"):
+        hand_bgr = _load_image({"image_base64": hand_src})
+    elif "image_path" in params and os.path.exists(params["image_path"]):
+        hand_bgr = cv2.imread(params["image_path"])
+    else:
+        default_path = os.path.join(REPO_ROOT, "templates", "default_studio_hand", "hand.jpg")
+        if not os.path.exists(default_path):
+            default_path = os.path.join(REPO_ROOT, "test_assets", "hand-template.jpg")
+        hand_bgr = cv2.imread(default_path)
+        if hand_bgr is None:
+            raise FileNotFoundError("Master studio hand template not found")
+
+    # 2. Landmarks
+    landmarks = params.get("landmarks") or DEFAULT_STUDIO_LANDMARKS
+
+    # 3. Mapped Nails
+    raw_mapped = params.get("mapped_nails", {})
+    mapped_nails_rgba = {}
+    for fname, b64 in raw_mapped.items():
+        if b64 and isinstance(b64, str):
+            try:
+                mapped_nails_rgba[fname] = _load_rgba_image(b64)
+            except Exception as e:
+                print(f"Warning: Failed to decode nail for {fname}: {e}")
+
+    # 4. Lighting & Export Options
+    lighting_options = params.get("lighting_options", {})
+    export_options = params.get("export_options", {})
+
+    out_dir = export_options.get("output_dir", "exports")
+    if not os.path.isabs(out_dir):
+        export_options["output_dir"] = os.path.join(REPO_ROOT, out_dir)
+
+    res = export_composite_package(
+        hand_bgr=hand_bgr,
+        landmarks=landmarks,
+        mapped_nails_rgba=mapped_nails_rgba,
+        lighting_options=lighting_options,
+        export_options=export_options,
+    )
+    res["execution_time_ms"] = int((time.time() - t0) * 1000)
+    return res
+
+
 HANDLERS = {
     "ping": handle_ping,
     "echo": handle_echo,
@@ -481,6 +532,7 @@ HANDLERS = {
     "auto_detect_hand": handle_auto_detect_hand,
     "refit_finger": handle_refit_finger,
     "render_composite": handle_render_composite,
+    "export_composite": handle_export_composite,
 }
 
 

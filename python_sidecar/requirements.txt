@@ -3,4 +3,6 @@ numpy>=1.24.0
 scipy>=1.10.0
 pillow>=10.0.0
 pytoshop>=1.2.1
+six>=1.16.0
+packbits>=0.6
 pyinstaller>=6.0.0

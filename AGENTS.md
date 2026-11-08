@@ -68,7 +68,7 @@ try-on-studio/
 | **Phase 2: Tray Extractor UI & Pen Tool** | ✅ Complete | Photoshop Bezier pen tool, pan/zoom, inspection modal, exact-mask design preservation |
 | **Phase 3: Hand Rigging Canvas & Bundled Master Template** | ✅ Complete | 5-point landmark rigging, pan/zoom canvas, procedural cuticle/AO/specular maps, `.nailtemplate` bundle |
 | **Phase 4: Real-Time PBR Compositor & Live Viewport** | ✅ Complete | Real-time viewport, dual-tier lighting controls, 98/100 visual audit score |
-| **Phase 5: Production Export & Layered PSD** | 🟡 **Next Up** | 300 DPI PNG & multi-layer PSD export |
+| **Phase 5: Production Export & Layered PSD** | ✅ Complete | 300 DPI PNG (pHYs metadata) & 5-layer PSD (pytoshop RLE) |
 
 ---
 

@@ -4,6 +4,7 @@ import { TrayControls } from "./TrayControls";
 import { LightingControls } from "./LightingControls";
 import { HandControls } from "./HandControls";
 import { ExportControls } from "./ExportControls";
+import { ExportAspectRatio } from "../canvas/ExportCanvas";
 
 interface InspectorPanelProps {
   activeTab: ActiveTab;
@@ -13,6 +14,8 @@ interface InspectorPanelProps {
   setTrayState: React.Dispatch<React.SetStateAction<TrayState>>;
   handState: HandState;
   setHandState: React.Dispatch<React.SetStateAction<HandState>>;
+  exportAspectRatio: ExportAspectRatio;
+  setExportAspectRatio: (r: ExportAspectRatio) => void;
 }
 
 export const InspectorPanel: React.FC<InspectorPanelProps> = ({
@@ -23,6 +26,8 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   setTrayState,
   handState,
   setHandState,
+  exportAspectRatio,
+  setExportAspectRatio,
 }) => {
   return (
     <aside className="w-96 bg-neutral-900/40 backdrop-blur-md flex flex-col overflow-y-auto border-l border-neutral-800">
@@ -38,7 +43,15 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           setLightingState={setLightingState}
         />
       )}
-      {activeTab === "export" && <ExportControls />}
+      {activeTab === "export" && (
+        <ExportControls
+          trayState={trayState}
+          handState={handState}
+          lightingState={lightingState}
+          aspectRatio={exportAspectRatio}
+          setAspectRatio={setExportAspectRatio}
+        />
+      )}
     </aside>
   );
 };

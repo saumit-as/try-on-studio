@@ -9,7 +9,6 @@ import React, {
   MouseEvent as ReactMouseEvent,
 } from "react";
 import {
-  Download,
   Upload,
   Loader2,
   AlertCircle,
@@ -30,6 +29,7 @@ import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor, HandState, L
 import { callSidecar } from "../../services/sidecar";
 import { HandRigCanvas } from "./HandRigCanvas";
 import { CompositeCanvas } from "./CompositeCanvas";
+import { ExportCanvas, ExportAspectRatio } from "./ExportCanvas";
 
 interface CanvasViewportProps {
   activeTab: ActiveTab;
@@ -39,6 +39,8 @@ interface CanvasViewportProps {
   setHandState: React.Dispatch<React.SetStateAction<HandState>>;
   lightingState: LightingState;
   setLightingState: React.Dispatch<React.SetStateAction<LightingState>>;
+  exportAspectRatio: ExportAspectRatio;
+  setExportAspectRatio: (r: ExportAspectRatio) => void;
 }
 
 const SLOT_PALETTE = [
@@ -178,6 +180,8 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
   setHandState,
   lightingState,
   setLightingState,
+  exportAspectRatio,
+  setExportAspectRatio,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -2070,18 +2074,16 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
           </div>
         )}
 
-        {/* Production Export Placeholder */}
+        {/* Phase 5: Production Export Stage */}
         {activeTab === "export" && (
-          <div className="flex flex-col items-center justify-center text-center max-w-md p-8 border border-neutral-800 rounded-2xl bg-neutral-900/40">
-            <div className="w-16 h-16 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center mb-4 text-amber-400 shadow-md">
-              <Download className="w-8 h-8" />
-            </div>
-            <h3 className="text-base font-semibold text-neutral-200 mb-1">
-              Phase 5: High-Res Production Export
-            </h3>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Render print-ready 300 DPI composite PNGs and multi-layer PSD files with preserved layer hierarchy and isolated blend modes.
-            </p>
+          <div className="w-full h-full relative">
+            <ExportCanvas
+              trayState={trayState}
+              handState={handState}
+              lightingState={lightingState}
+              aspectRatio={exportAspectRatio}
+              setAspectRatio={setExportAspectRatio}
+            />
           </div>
         )}
       </div>

@@ -184,12 +184,13 @@ Open the **Compositor & Lighting** tab:
 > **Objective:** Export print-ready 300 DPI composites and layered PSD files for professional e-commerce use.
 
 ### Tasks
-- [ ] Implement full-resolution composite export in `python_sidecar/export.py`:
-  - 300 DPI rendering in standard ratios (1:1 Square, 4:5 Portrait, 16:9 Banner).
-  - Transparent Hand PNG (cutout without background).
-- [ ] Multi-layer PSD generation via `pytoshop`:
-  - Preserves 6 distinct layers with matching blend modes (Normal, Multiply, Screen).
-- [ ] Wire [`ExportControls.tsx`](file:///c:/Users/Timuas/Projects/try-on-studio/src/components/inspector/ExportControls.tsx) with native OS Save Dialog (`@tauri-apps/plugin-dialog`).
+- [x] Implement full-resolution composite export in `python_sidecar/export.py`:
+  - [x] 300 DPI rendering in standard ratios (Original, 1:1 Square, 4:5 Portrait, 16:9 Banner).
+  - [x] Transparent Hand PNG (cutout without background) and solid studio backdrop.
+- [x] Multi-layer PSD generation via `pytoshop`:
+  - [x] Preserves 5 distinct layers with authentic blend modes (Normal, Multiply 84%, Screen, Normal).
+  - [x] Automated monkey-patch for NumPy 2.x virtual channel uint8 overflow.
+- [x] Wire [`ExportControls.tsx`](src/components/inspector/ExportControls.tsx) and [`ExportCanvas.tsx`](src/components/canvas/ExportCanvas.tsx) with live framing guides, DPI resolution displays, and JSON-RPC dispatch.
 
 ### 🧪 Testable Deliverable
 In the **Export** tab:

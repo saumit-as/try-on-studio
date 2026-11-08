@@ -545,10 +545,15 @@ def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "aut
         raise ValueError("Invalid contour coordinates")
 
     # 3. Detect 4 Upright Main Fingers (y < palm_y - palm_r * 0.22)
+    # Ignore border pixels (within 3% of top edge or sides) to avoid contour artifacts
+    y_min_cutoff = int(h * 0.04)
+    x_min_cutoff = int(w * 0.03)
+    x_max_cutoff = int(w * 0.97)
+
     col_tops: Dict[int, int] = {}
     for p in pts:
         x, y = int(p[0]), int(p[1])
-        if y < palm_y - palm_r * 0.22:
+        if y > y_min_cutoff and y < (palm_y - palm_r * 0.22) and x_min_cutoff < x < x_max_cutoff:
             if x not in col_tops or y < col_tops[x]:
                 col_tops[x] = y
 
@@ -567,11 +572,16 @@ def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "aut
             if val == np.min(ys_smooth[i - win : i + win + 1]):
                 local_max = np.max(ys_smooth[max(0, i - win * 2) : min(len(ys_smooth), i + win * 2 + 1)])
                 depth = local_max - val
-                if depth > 6:
+                if depth > 12:  # Distinguish prominent finger apex from subtle ripples
                     minima.append((xs[i], int(ys[i]), depth))
 
-        min_tip_spacing = max(22, int(palm_r * 0.22))
-        for m in sorted(minima, key=lambda x: x[1]):  # highest first
+        min_tip_spacing = max(24, int(palm_r * 0.24))
+        # Select candidates, prioritizing fingers directly above the palm span
+        valid_minima = [
+            m for m in minima
+            if abs(m[0] - palm_x) < (palm_r * 1.35)
+        ]
+        for m in sorted(valid_minima, key=lambda x: x[1]):  # highest first
             x_m, y_m, _ = m
             if not any(abs(x_m - f[0]) < min_tip_spacing for f in four_fingers):
                 four_fingers.append((x_m, y_m))
@@ -587,22 +597,23 @@ def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "aut
     right_extent = float(np.max(right_pts[:, 0]) - palm_x) if len(right_pts) > 0 else 0.0
     left_extent = float(palm_x - np.min(left_pts[:, 0])) if len(left_pts) > 0 else 0.0
 
-    # Determine handedness
+    # Determine handedness:
+    # On a dorsal (knuckles/nails facing camera) hand:
+    # Thumb on left => Right Hand
+    # Thumb on right => Left Hand
     if handedness_hint in ("left", "right"):
         handedness = handedness_hint
     else:
-        # Anatomical law: Thumb tip is lower (larger y) than pinky tip
-        if len(four_fingers) >= 2:
-            y_left = four_fingers[0][1]
-            y_right = four_fingers[-1][1]
-            if right_extent > 0 and len(right_pts) > 0 and right_pts[:, 1].max() > y_left + 25:
-                handedness = "left"
-            elif left_extent > 0 and len(left_pts) > 0 and left_pts[:, 1].max() > y_right + 25:
-                handedness = "right"
-            else:
-                handedness = "left" if right_extent >= left_extent else "right"
+        # Check lateral prominence of thumb compared to hypothenar margin
+        if left_extent > right_extent * 1.08:
+            handedness = "right"
+        elif right_extent > left_extent * 1.08:
+            handedness = "left"
         else:
-            handedness = "left" if right_extent >= left_extent else "right"
+            # Fallback: check which side has a lower lateral protrusion
+            left_lowest_y = float(np.max(left_pts[:, 1])) if len(left_pts) > 0 else 0.0
+            right_lowest_y = float(np.max(right_pts[:, 1])) if len(right_pts) > 0 else 0.0
+            handedness = "right" if left_extent >= right_extent else "left"
 
     if handedness == "left" and len(right_pts) > 0:
         dists_thumb = (right_pts[:, 0] - palm_x) * 1.0 - (right_pts[:, 1] - palm_y) * 0.5
