@@ -173,17 +173,14 @@ def rectify_backing_card(
 
 def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) -> np.ndarray:
     """
-    Constructs a 100% bilaterally symmetric, G2-smooth anatomical press-on nail alpha mask
+    Constructs a 100% bilaterally symmetric, smooth anatomical press-on nail alpha mask
     from a deskewed, upright binary mask (where y = 0 is the free-edge tip and
     y = h - 1 is the cuticle base).
 
-    Fits an adaptive 2-piece super-elliptical profile (upper tip arch + lower cuticle U-cup)
-    blended with Savitzky-Golay smoothing so that:
-      - The equator sits naturally in the lower-middle zone (36%-48% up from the cuticle base).
-      - Both the free-edge tip (y = 0) and cuticle base (y = h - 1) terminate with a true
-        horizontal tangent (elliptical square-root cap, never a pointed sine cone).
-      - Almond, Oval, Squoval, Square, Coffin, and Stiletto tip profiles are faithfully
-        preserved via data-driven exponent fitting.
+    Preserves exact salon silhouette geometry:
+      - Square, Squoval, and Coffin shapes retain wide, flat distal tips and sharp/squoval shoulders.
+      - Almond, Oval, and Stiletto shapes retain continuous G2 super-elliptical arches.
+      - Cuticle base (y = h - 1) always terminates with a true horizontal tangent U-cup.
     """
     h, w = mask.shape[:2]
     if h < 10 or w < 10:
@@ -231,134 +228,174 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
         w_pre = measured_half_w.copy()
 
     # Locate the anatomical equator in the lower-middle zone [0.58 * nail_h, 0.66 * nail_h]
-    # (matching ground-truth worn nail anatomy y_eq ~ 0.64)
     eq_start = int(0.58 * nail_h)
     eq_end = max(eq_start + 1, int(0.66 * nail_h))
     eq_zone = w_pre[eq_start:eq_end]
     i_peak = eq_start + int(np.argmax(eq_zone)) if len(eq_zone) > 0 else int(0.63 * nail_h)
     i_peak = int(np.clip(i_peak, max(4, int(0.58 * nail_h)), min(nail_h - 5, int(0.66 * nail_h))))
+    w_eq = max(2.0, float(w_pre[i_peak]))
 
-    # Enforce anatomical monotonicity toward i_peak:
-    w_mono = w_pre.copy()
-    for i in range(1, i_peak + 1):
-        if w_mono[i] < w_mono[i - 1]:
-            w_mono[i] = w_mono[i - 1]
-    for i in range(nail_h - 2, i_peak - 1, -1):
-        if w_mono[i] < w_mono[i + 1]:
-            w_mono[i] = w_mono[i + 1]
+    # Analyze tip flattening ratio in the distal 3% - 15% zone
+    tip_zone_start = max(1, int(0.03 * nail_h))
+    tip_zone_end = max(tip_zone_start + 1, int(0.15 * nail_h))
+    w_tip_measured = float(np.median(w_pre[tip_zone_start:tip_zone_end]))
+    flat_ratio = w_tip_measured / w_eq
+    is_flat_tip = flat_ratio >= 0.55  # Square, Squoval, Coffin
 
-    w_eq = max(2.0, float(w_mono[i_peak]))
+    if not is_flat_tip:
+        # -------------------------------------------------------------
+        # ALMOND / OVAL / STILETTO: G2 Continuous Super-Ellipse Arch
+        # -------------------------------------------------------------
+        w_mono = w_pre.copy()
+        for i in range(1, i_peak + 1):
+            if w_mono[i] < w_mono[i - 1]:
+                w_mono[i] = w_mono[i - 1]
+        for i in range(nail_h - 2, i_peak - 1, -1):
+            if w_mono[i] < w_mono[i + 1]:
+                w_mono[i] = w_mono[i + 1]
 
-    # Fit adaptive 2-piece G2-continuous super-ellipse to w_mono:
-    # 1. Upper arch (tip y=0 to equator y=i_peak): u_tip = (i_peak - i) / i_peak in [0, 1]
-    # Ground-truth Almond/Oval reference has (p_up ~ 1.82, q_up ~ 2.18)
-    u_tip = np.linspace(1.0, 0.0, i_peak + 1, dtype=np.float64)
-    target_upper = np.clip(w_mono[: i_peak + 1] / w_eq, 0.0, 1.0)
-    fit_mask_up = (u_tip >= 0.12) & (u_tip <= 0.86)
-    best_err_up = float("inf")
-    best_p_up, best_q_up = 1.82, 2.18
-    if np.any(fit_mask_up):
-        u_sub = u_tip[fit_mask_up]
-        t_sub = target_upper[fit_mask_up]
-        for p_cand in np.linspace(1.80, 3.40, 21):
-            base_curve = np.clip(1.0 - (u_sub ** p_cand), 1e-6, 1.0)
-            for q_cand in np.linspace(2.12, 2.65, 14):
-                pred = base_curve ** (1.0 / q_cand)
-                prior = 0.0008 * ((p_cand - 1.82) ** 2 + (q_cand - 2.18) ** 2)
-                err = float(np.mean((pred - t_sub) ** 2)) + prior
-                if err < best_err_up:
-                    best_err_up = err
-                    best_p_up = float(p_cand)
-                    best_q_up = float(q_cand)
+        u_tip = np.linspace(1.0, 0.0, i_peak + 1, dtype=np.float64)
+        target_upper = np.clip(w_mono[: i_peak + 1] / w_eq, 0.0, 1.0)
+        fit_mask_up = (u_tip >= 0.12) & (u_tip <= 0.86)
+        best_err_up = float("inf")
+        best_p_up, best_q_up = 1.82, 2.18
+        if np.any(fit_mask_up):
+            u_sub = u_tip[fit_mask_up]
+            t_sub = target_upper[fit_mask_up]
+            for p_cand in np.linspace(1.80, 3.40, 21):
+                base_curve = np.clip(1.0 - (u_sub ** p_cand), 1e-6, 1.0)
+                for q_cand in np.linspace(2.12, 2.65, 14):
+                    pred = base_curve ** (1.0 / q_cand)
+                    prior = 0.0008 * ((p_cand - 1.82) ** 2 + (q_cand - 2.18) ** 2)
+                    err = float(np.mean((pred - t_sub) ** 2)) + prior
+                    if err < best_err_up:
+                        best_err_up = err
+                        best_p_up = float(p_cand)
+                        best_q_up = float(q_cand)
 
-    w_upper_analytic = w_eq * (np.clip(1.0 - (u_tip ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
+        w_upper_analytic = w_eq * (np.clip(1.0 - (u_tip ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
 
-    # 2. Lower cuticle U-cup (equator y=i_peak to cuticle base y=nail_h-1): u_cut in [0, 1]
-    # Ground-truth reference has (p_low ~ 2.05, q_low ~ 2.40) for a full, rounded cuticle U-cup
-    n_lower = nail_h - i_peak
-    u_cut = np.linspace(0.0, 1.0, n_lower, dtype=np.float64)
-    target_lower = np.clip(w_mono[i_peak:] / w_eq, 0.0, 1.0)
-    fit_mask_low = (u_cut >= 0.12) & (u_cut <= 0.82)
-    best_err_low = float("inf")
-    best_p_low, best_q_low = 2.05, 2.40
-    if np.any(fit_mask_low):
-        u_sub_l = u_cut[fit_mask_low]
-        t_sub_l = target_lower[fit_mask_low]
-        for p_cand in np.linspace(2.00, 2.45, 10):
-            base_curve = np.clip(1.0 - (u_sub_l ** p_cand), 1e-6, 1.0)
-            for q_cand in np.linspace(2.30, 2.65, 9):
-                pred = base_curve ** (1.0 / q_cand)
-                prior = 0.0008 * ((p_cand - 2.05) ** 2 + (q_cand - 2.40) ** 2)
-                err = float(np.mean((pred - t_sub_l) ** 2)) + prior
-                if err < best_err_low:
-                    best_err_low = err
-                    best_p_low = float(p_cand)
-                    best_q_low = float(q_cand)
+        n_lower = nail_h - i_peak
+        u_cut = np.linspace(0.0, 1.0, n_lower, dtype=np.float64)
+        target_lower = np.clip(w_mono[i_peak:] / w_eq, 0.0, 1.0)
+        fit_mask_low = (u_cut >= 0.12) & (u_cut <= 0.82)
+        best_err_low = float("inf")
+        best_p_low, best_q_low = 2.05, 2.40
+        if np.any(fit_mask_low):
+            u_sub_l = u_cut[fit_mask_low]
+            t_sub_l = target_lower[fit_mask_low]
+            for p_cand in np.linspace(2.00, 2.45, 10):
+                base_curve = np.clip(1.0 - (u_sub_l ** p_cand), 1e-6, 1.0)
+                for q_cand in np.linspace(2.30, 2.65, 9):
+                    pred = base_curve ** (1.0 / q_cand)
+                    prior = 0.0008 * ((p_cand - 2.05) ** 2 + (q_cand - 2.40) ** 2)
+                    err = float(np.mean((pred - t_sub_l) ** 2)) + prior
+                    if err < best_err_low:
+                        best_err_low = err
+                        best_p_low = float(p_cand)
+                        best_q_low = float(q_cand)
 
-    w_lower_analytic = w_eq * (np.clip(1.0 - (u_cut ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
+        w_lower_analytic = w_eq * (np.clip(1.0 - (u_cut ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
+        w_analytic = np.concatenate([w_upper_analytic[:-1], w_lower_analytic])
 
-    w_analytic = np.concatenate([w_upper_analytic[:-1], w_lower_analytic])
+        win_len = max(7, int(nail_h * 0.25) | 1)
+        if 7 <= win_len < nail_h:
+            w_smooth = scipy.signal.savgol_filter(w_mono, window_length=win_len, polyorder=3)
+            w_smooth = np.maximum(0.0, w_smooth)
+        else:
+            w_smooth = w_mono.copy()
 
-    # Heavy Savitzky-Golay smoothing on w_mono with elliptical cap rounding
-    win_len = max(7, int(nail_h * 0.25) | 1)
-    if 7 <= win_len < nail_h:
-        w_smooth = scipy.signal.savgol_filter(w_mono, window_length=win_len, polyorder=3)
-        w_smooth = np.maximum(0.0, w_smooth)
+        tip_cap_len = max(4, int(0.14 * float(nail_h)))
+        if tip_cap_len < nail_h:
+            t_cap = np.linspace(0.0, 1.0, tip_cap_len, dtype=np.float64)
+            ellip_tip = np.sqrt(np.clip(1.0 - (1.0 - t_cap) ** 2, 0.0, 1.0))
+            w_smooth[:tip_cap_len] = np.minimum(w_smooth[:tip_cap_len], w_smooth[tip_cap_len - 1] * ellip_tip)
+
+        cut_cap_len = max(5, int(0.16 * float(nail_h)))
+        if cut_cap_len < nail_h:
+            t_cut = np.linspace(0.0, 1.0, cut_cap_len, dtype=np.float64)
+            ellip_cut = np.sqrt(np.clip(1.0 - (1.0 - t_cut) ** 2, 0.0, 1.0))
+            w_smooth[nail_h - cut_cap_len :] = np.minimum(
+                w_smooth[nail_h - cut_cap_len :],
+                w_smooth[nail_h - cut_cap_len] * ellip_cut[::-1],
+            )
+
+        theta_up = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
+        u_tip_dense = np.cos(theta_up)
+        y_up_dense = float(y_min) + (1.0 - u_tip_dense) * float(i_peak)
+        w_up_analytic_dense = w_eq * (np.clip(1.0 - (u_tip_dense ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
+        w_up_smooth_dense = np.interp(y_up_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
+        w_up_dense = 0.94 * w_up_analytic_dense + 0.06 * w_up_smooth_dense
+
+        theta_low = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
+        u_cut_dense = np.sin(theta_low)
+        y_low_dense = float(y_min + i_peak) + u_cut_dense * float(max(1, nail_h - 1 - i_peak))
+        w_low_analytic_dense = w_eq * (np.clip(1.0 - (u_cut_dense ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
+        w_low_smooth_dense = np.interp(y_low_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
+        w_low_dense = 0.94 * w_low_analytic_dense + 0.06 * w_low_smooth_dense
+
+        ys_dense = np.concatenate([y_up_dense[:-1], y_low_dense])
+        half_w_dense = np.concatenate([w_up_dense[:-1], w_low_dense])
+        half_w_dense[0] = 0.0
+        half_w_dense[-1] = 0.0
+
+        left_pts = np.column_stack([center_x - half_w_dense, ys_dense])[::-1]
+        right_pts = np.column_stack([center_x + half_w_dense, ys_dense])
+        poly_pts = np.vstack([left_pts, right_pts])
+
     else:
-        w_smooth = w_mono.copy()
+        # -------------------------------------------------------------
+        # SQUARE / SQUOVAL / COFFIN: Flat Distal Free-Edge Preservation
+        # -------------------------------------------------------------
+        win_len = max(7, int(nail_h * 0.22) | 1)
+        if 7 <= win_len < nail_h:
+            w_smooth = scipy.signal.savgol_filter(w_pre, window_length=win_len, polyorder=min(3, win_len - 1))
+            w_smooth = np.maximum(0.0, w_smooth)
+        else:
+            w_smooth = w_pre.copy()
 
-    # Apply true elliptical (sqrt) rounding to the top 14% and bottom 16% of w_smooth
-    tip_cap_len = max(4, int(0.14 * float(nail_h)))
-    if tip_cap_len < nail_h:
-        t_cap = np.linspace(0.0, 1.0, tip_cap_len, dtype=np.float64)
-        ellip_tip = np.sqrt(np.clip(1.0 - (1.0 - t_cap) ** 2, 0.0, 1.0))
-        w_smooth[:tip_cap_len] = np.minimum(w_smooth[:tip_cap_len], w_smooth[tip_cap_len - 1] * ellip_tip)
+        w_mono = w_smooth.copy()
+        for i in range(1, i_peak + 1):
+            if w_mono[i] < w_mono[i - 1]:
+                w_mono[i] = w_mono[i - 1]
+        for i in range(nail_h - 2, i_peak - 1, -1):
+            if w_mono[i] < w_mono[i + 1]:
+                w_mono[i] = w_mono[i + 1]
 
-    cut_cap_len = max(5, int(0.16 * float(nail_h)))
-    if cut_cap_len < nail_h:
-        t_cut = np.linspace(0.0, 1.0, cut_cap_len, dtype=np.float64)
-        ellip_cut = np.sqrt(np.clip(1.0 - (1.0 - t_cut) ** 2, 0.0, 1.0))
-        w_smooth[nail_h - cut_cap_len :] = np.minimum(
-            w_smooth[nail_h - cut_cap_len :],
-            w_smooth[nail_h - cut_cap_len] * ellip_cut[::-1],
-        )
+        # Lower cuticle U-cup (bottom 16% anatomical rounding)
+        cut_cap_len = max(5, int(0.16 * float(nail_h)))
+        if cut_cap_len < nail_h:
+            t_cut = np.linspace(0.0, 1.0, cut_cap_len, dtype=np.float64)
+            ellip_cut = np.sqrt(np.clip(1.0 - (1.0 - t_cut) ** 2, 0.0, 1.0))
+            w_mono[nail_h - cut_cap_len :] = np.minimum(
+                w_mono[nail_h - cut_cap_len :],
+                w_mono[nail_h - cut_cap_len] * ellip_cut[::-1],
+            )
 
-    # Use 94% G2 super-ellipse + 6% elliptically-capped Savitzky-Golay profile
-    final_half_w = 0.94 * w_analytic + 0.06 * w_smooth
-    final_half_w[0] = 0.0
-    final_half_w[-1] = 0.0
+        # Distal tip: preserve flat edge width and shoulder corners
+        tip_corner_len = max(2, int(0.035 * float(nail_h)))
+        if flat_ratio < 0.78:
+            # Squoval / Coffin: slight shoulder radius
+            t_corn = np.linspace(0.0, 1.0, tip_corner_len, dtype=np.float64)
+            corn_round = np.sqrt(np.clip(1.0 - (1.0 - t_corn) ** 2, 0.0, 1.0))
+            w_mono[:tip_corner_len] = np.minimum(w_mono[:tip_corner_len], w_tip_measured * corn_round)
+        else:
+            # Square: sharp orthogonal tip edge
+            w_mono[:tip_corner_len] = np.maximum(w_mono[:tip_corner_len], w_tip_measured * 0.96)
 
-    # Evaluate at dense cosine-spaced sub-pixel y coordinates near the top tip (y_min) and
-    # bottom cuticle (y_max) so the horizontal tangent caps are rasterized with sub-pixel
-    # smoothness (avoiding a coarse 1-scanline jump from w ~ 12px to w = 0 at the poles).
-    theta_up = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
-    u_tip_dense = np.cos(theta_up)  # 1.0 at tip (y_min) -> 0.0 at equator (y_min + i_peak)
-    y_up_dense = float(y_min) + (1.0 - u_tip_dense) * float(i_peak)
-    w_up_analytic_dense = w_eq * (
-        np.clip(1.0 - (u_tip_dense ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up)
-    )
-    w_up_smooth_dense = np.interp(y_up_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
-    w_up_dense = 0.94 * w_up_analytic_dense + 0.06 * w_up_smooth_dense
+        ys_scan = np.arange(y_min, y_max + 1, dtype=np.float64)
+        left_pts = np.column_stack([center_x - w_mono, ys_scan])[::-1]
+        right_pts = np.column_stack([center_x + w_mono, ys_scan])
 
-    theta_low = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
-    u_cut_dense = np.sin(theta_low)  # 0.0 at equator -> 1.0 at cuticle base (y_max)
-    y_low_dense = float(y_min + i_peak) + u_cut_dense * float(max(1, nail_h - 1 - i_peak))
-    w_low_analytic_dense = w_eq * (
-        np.clip(1.0 - (u_cut_dense ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low)
-    )
-    w_low_smooth_dense = np.interp(y_low_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
-    w_low_dense = 0.94 * w_low_analytic_dense + 0.06 * w_low_smooth_dense
-
-    ys_dense = np.concatenate([y_up_dense[:-1], y_low_dense])
-    half_w_dense = np.concatenate([w_up_dense[:-1], w_low_dense])
-    half_w_dense[0] = 0.0
-    half_w_dense[-1] = 0.0
+        # Insert horizontal top flat edge vertices
+        if w_mono[0] > 1.0:
+            top_left = [center_x - w_mono[0], float(y_min)]
+            top_right = [center_x + w_mono[0], float(y_min)]
+            poly_pts = np.vstack([left_pts, [top_left, top_right], right_pts])
+        else:
+            poly_pts = np.vstack([left_pts, right_pts])
 
     # Rasterize contour at 4x supersampling
-    left_pts = np.column_stack([center_x - half_w_dense, ys_dense])[::-1]
-    right_pts = np.column_stack([center_x + half_w_dense, ys_dense])
-    poly_pts = np.vstack([left_pts, right_pts])
-
     ss = 4
     mask_ss = np.zeros((h * ss, w * ss), dtype=np.uint8)
     cv2.fillPoly(mask_ss, [np.round(poly_pts * ss).astype(np.int32).reshape(-1, 1, 2)], 255)
@@ -592,6 +629,45 @@ def segment_packaging_tray(
     # Step 1: Perspective rectification
     rect_img, H, card_quad = rectify_backing_card(image)
     h_img, w_img = rect_img.shape[:2]
+
+    # Check for fine-tuned ML segmentation model
+    try:
+        from ml_models import get_model_manager
+        ml_mgr = get_model_manager()
+        if ml_mgr.has_tray_model():
+            ml_slots = ml_mgr.segment_tray_ml(rect_img)
+            if ml_slots and len(ml_slots) >= 5:
+                H_inv = np.linalg.inv(H) if H is not None else None
+                final_slots = []
+                for s in ml_slots[:max_slots]:
+                    cnt_rect = np.array(s["contour"], dtype=np.float32).reshape(-1, 1, 2)
+                    if H_inv is not None:
+                        cnt_orig = cv2.perspectiveTransform(cnt_rect, H_inv).reshape(-1, 2)
+                    else:
+                        cnt_orig = cnt_rect.reshape(-1, 2)
+
+                    cnt_int = np.round(cnt_orig).astype(np.int32)
+                    x, y, w, h = cv2.boundingRect(cnt_int)
+                    area = float(cv2.contourArea(cnt_int))
+                    aspect = float(h / max(1, w))
+                    shape_info = classify_nail_shape(cnt_int)
+                    pca_angle, _, _ = deskew_nail_pca(cnt_int)
+
+                    final_slots.append({
+                        "slot_id": s["slot_id"],
+                        "bbox": [int(x), int(y), int(w), int(h)],
+                        "contour": cnt_int.tolist(),
+                        "area": round(area, 1),
+                        "aspect_ratio": round(aspect, 3),
+                        "pca_angle": round(float(pca_angle), 2),
+                        "shape_info": shape_info,
+                        "homography": H.tolist() if H is not None else None,
+                        "card_quad": card_quad.tolist() if card_quad is not None else None,
+                    })
+                if len(final_slots) >= 5:
+                    return final_slots
+    except Exception as e:
+        pass
 
     gray: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2GRAY)
     hsv: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2HSV)

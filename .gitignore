@@ -1,8 +1,18 @@
-# Python
+# Python & Environments
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.venv-gpu/
+
+# ML Training, Weights & Exports
+runs/
+*.pt
+exports/
+datasets/
+models/*.pt
+
+# Test & Debug Outputs
 test_output/
 test_output_fingers.jpg
 
