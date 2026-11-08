@@ -138,6 +138,30 @@ def handle_extract_nail(params):
     }
 
 
+def handle_segment_prompt(params):
+    img = _load_image(params)
+    bbox = params.get("bbox")
+    if not bbox or len(bbox) != 4:
+        raise ValueError("Parameter 'bbox' must be a 4-element list [x0, y0, x1, y1] in original-image coordinates.")
+
+    points = params.get("points")
+    prev_mask_id = params.get("prev_mask_id")
+    image_id = params.get("image_id")
+    slot_id = params.get("slot_id", 1)
+
+    from ml_models import get_sam_runner
+    runner = get_sam_runner()
+    result = runner.predict_prompt(
+        img,
+        bbox=bbox,
+        points=points,
+        prev_mask_id=prev_mask_id,
+        image_id=image_id,
+        slot_id=slot_id,
+    )
+    return result
+
+
 def handle_refit_slot_contour(params):
     """
     Re-fits and extracts a localized nail contour within a user-nudged or resized bounding box.
@@ -522,6 +546,7 @@ HANDLERS = {
     "ping": handle_ping,
     "echo": handle_echo,
     "segment_tray": handle_segment_tray,
+    "segment_prompt": handle_segment_prompt,
     "extract_nail": handle_extract_nail,
     "refit_slot_contour": handle_refit_slot_contour,
     "warp_nail": handle_warp_nail,
