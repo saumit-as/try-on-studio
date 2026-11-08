@@ -199,3 +199,14 @@ In the **Export** tab:
 
 > [!IMPORTANT]
 > **User Feedback Checkpoint 5**: Final review of output assets, file sizes, and e-commerce readiness.
+
+---
+
+## Future Enhancements & Performance Backlog
+
+Tracked in [`docs/future-enhancements.md`](future-enhancements.md):
+- **Sidecar Cold-Start & Startup Latency Optimization** (Lazy imports in `main.py`, in-function scoping of `scipy.signal`, deferred ONNX initialization).
+- **Release Sidecar Binary Compilation** (Frozen PyInstaller/Nuitka binary).
+- **Windows Dev Linker Acceleration** (`rust-lld.exe` configuration).
+- **Local Learning Flywheel** (Local-only regression benchmark capture).
+
