@@ -121,7 +121,7 @@ def handle_extract_nail(params):
     feather_px = float(params.get("feather_px", 1.2))
     deskew = bool(params.get("deskew", True))
     auto_orient = bool(params.get("auto_orient_cuticle_down", True))
-    exact_mask = bool(params.get("exact_mask", True))
+    exact_mask = bool(params.get("exact_mask", False))
     slot_id = int(params.get("slot_id", 1))
     debug_dump = bool(params.get("debug_dump", False) or os.environ.get("TRYON_DEBUG") == "1")
 

@@ -48,7 +48,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   const [nudgeStep, setNudgeStep] = useState<number>(5);
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
   const [modalZoom, setModalZoom] = useState<number>(1);
-  const [forceExactMask, setForceExactMask] = useState<boolean>(true);
+  const [forceExactMask, setForceExactMask] = useState<boolean>(false);
   const [isRefiningSam, setIsRefiningSam] = useState<boolean>(false);
   const [isDumpingDebug, setIsDumpingDebug] = useState<boolean>(false);
   const [debugMessage, setDebugMessage] = useState<string | null>(null);
@@ -418,9 +418,9 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
           return { ...prev, detectedSlots: nextSlots };
         });
 
-        // Trigger immediate re-extraction with new contour
+        // Trigger immediate re-extraction with new contour (Super-Ellipse by default)
         setTimeout(() => {
-          handleReExtract(true);
+          handleReExtract(false);
         }, 50);
         setDebugMessage("✓ Nail contour successfully refined with MobileSAM AI!");
         setTimeout(() => setDebugMessage(null), 5000);

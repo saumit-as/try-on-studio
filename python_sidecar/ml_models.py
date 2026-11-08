@@ -310,7 +310,7 @@ class MobileSAMRunner:
         Crops native image with +10% padding, upsamples logits, solves alpha via Guided Filter,
         and applies adaptive choke + soft feather + radial color bleed.
         """
-        from segmentation import dematte_nail_edges, classify_nail_shape
+        from segmentation import dematte_nail_edges, classify_nail_shape, smooth_contour_spline
 
         orig_h, orig_w = image_bgr.shape[:2]
         x_min, y_min, x_max, y_max = bbox
@@ -358,7 +358,8 @@ class MobileSAMRunner:
 
         if cnts:
             nail_cnt = max(cnts, key=cv2.contourArea)
-            nail_cnt_orig = nail_cnt + np.array([[[cx0, cy0]]])
+            nail_cnt_raw = nail_cnt + np.array([[[cx0, cy0]]])
+            nail_cnt_orig = smooth_contour_spline(nail_cnt_raw, target_points=80)
         else:
             # Fallback to prompt box boundary
             box_poly = np.array([
@@ -393,7 +394,7 @@ class MobileSAMRunner:
         Transparent classical fallback when ONNX models are unavailable.
         Uses Otsu thresholding + morphology inside the prompt box.
         """
-        from segmentation import classify_nail_shape, dematte_nail_edges
+        from segmentation import classify_nail_shape, dematte_nail_edges, smooth_contour_spline
 
         orig_h, orig_w = image_bgr.shape[:2]
         bx0, by0, bx1, by1 = [float(v) for v in bbox]
@@ -414,7 +415,8 @@ class MobileSAMRunner:
         cnts, _ = cv2.findContours(dematted[:, :, 3], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
             nail_cnt = max(cnts, key=cv2.contourArea)
-            nail_cnt_orig = nail_cnt + np.array([[[x_min, y_min]]])
+            nail_cnt_raw = nail_cnt + np.array([[[x_min, y_min]]])
+            nail_cnt_orig = smooth_contour_spline(nail_cnt_raw, target_points=80)
         else:
             nail_cnt_orig = np.array([
                 [[x_min, y_min]], [[x_max, y_min]], [[x_max, y_max]], [[x_min, y_max]]

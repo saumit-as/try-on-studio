@@ -394,6 +394,10 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
   const fetchNailPreview = async (imageSrc: string, slot: DetectedSlot) => {
     try {
+      const isCustomPen =
+        !!(slot.pen_anchors && slot.pen_anchors.length > 0) ||
+        !!(trayState.slotPenAnchors?.[slot.slot_id] && trayState.slotPenAnchors[slot.slot_id].length > 0);
+
       const ext = await callSidecar<{
         status: string;
         width: number;
@@ -406,7 +410,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         slot_id: slot.slot_id,
         deskew: true,
         auto_orient_cuticle_down: true,
-        exact_mask: true,
+        exact_mask: isCustomPen,
       });
 
       if (ext && ext.status === "ok" && ext.image_base64) {

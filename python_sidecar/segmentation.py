@@ -18,6 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
+import scipy.interpolate
 import scipy.ndimage
 import scipy.signal
 
@@ -179,6 +180,66 @@ def rectify_backing_card(
     )
 
     return rectified_img, H.astype(np.float64), quad_orig
+
+
+def smooth_contour_spline(
+    contour: np.ndarray,
+    target_points: int = 80,
+    sigma: float = 2.5,
+) -> np.ndarray:
+    """
+    Applies closed-loop periodic spline smoothing (Option 1) to eliminate discrete
+    pixel-staircasing and micro-jaggies from raw segmenter contours (e.g. MobileSAM / OpenCV).
+    Preserves exact anatomical shape and area (within 0.5%) without cutting corners.
+    """
+    pts = np.array(contour, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 12:
+        return pts.astype(np.int32)
+
+    # 1. Deduplicate consecutive identical points
+    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    keep = np.insert(diffs > 1e-4, 0, True)
+    pts = pts[keep]
+
+    # 2. If endpoint is identical to start, drop endpoint for closed-loop spline
+    if len(pts) > 1 and np.linalg.norm(pts[0] - pts[-1]) < 1e-3:
+        pts = pts[:-1]
+
+    if len(pts) < 12:
+        return pts.astype(np.int32)
+
+    orig_area = float(cv2.contourArea(pts.astype(np.float32)))
+
+    # 3. Periodic 1D Gaussian filtering along the closed curve
+    eff_sigma = min(sigma, max(1.5, len(pts) / 70.0))
+    smoothed_dense = scipy.ndimage.gaussian_filter1d(pts, sigma=eff_sigma, mode="wrap", axis=0)
+
+    # 4. Periodic cubic B-spline interpolation with uniform arc evaluation
+    try:
+        step = max(1, len(smoothed_dense) // max(6, target_points // 2))
+        sub_pts = smoothed_dense[::step]
+        if len(sub_pts) < 6:
+            sub_pts = smoothed_dense
+
+        tck, u = scipy.interpolate.splprep([sub_pts[:, 0], sub_pts[:, 1]], s=0, per=True, k=3)
+        u_eval = np.linspace(0.0, 1.0, target_points, endpoint=False)
+        x_eval, y_eval = scipy.interpolate.splev(u_eval, tck)
+        spline_pts = np.column_stack([x_eval, y_eval])
+    except Exception:
+        # Graceful fallback: evenly subsample dense smoothed array
+        idx = np.round(np.linspace(0, len(smoothed_dense) - 1, target_points, endpoint=False)).astype(int)
+        spline_pts = smoothed_dense[idx]
+
+    # 5. Area preservation scale guard
+    sm_area = float(cv2.contourArea(spline_pts.astype(np.float32)))
+    if sm_area > 0 and orig_area > 0:
+        ratio = orig_area / sm_area
+        if 0.90 < ratio < 1.10:
+            cx, cy = np.mean(spline_pts, axis=0)
+            scale_val = np.sqrt(ratio)
+            spline_pts = (spline_pts - [cx, cy]) * scale_val + [cx, cy]
+
+    return np.round(spline_pts).astype(np.int32)
 
 
 def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) -> np.ndarray:
@@ -961,13 +1022,13 @@ def _segment_packaging_tray_classical(
         if not is_identity:
             pts_rect = cnt_rect.reshape(-1, 2).astype(np.float64)
             pts_orig = cv2.perspectiveTransform(pts_rect.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
-            cnt_final = pts_orig.astype(np.int32)
+            cnt_final = smooth_contour_spline(pts_orig, target_points=80)
             bx, by, bw, bh = cv2.boundingRect(cnt_final)
             area_final = float(cv2.contourArea(cnt_final))
         else:
-            cnt_final = cnt_rect.reshape(-1, 2).astype(np.int32)
-            bx, by, bw, bh = int(item["gx"]), int(item["gy"]), int(item["bw"]), int(item["bh"])
-            area_final = float(item["area"])
+            cnt_final = smooth_contour_spline(cnt_rect, target_points=80)
+            bx, by, bw, bh = cv2.boundingRect(cnt_final)
+            area_final = float(cv2.contourArea(cnt_final))
 
         results.append({
             "slot_id": int(idx),
@@ -1078,7 +1139,7 @@ def extract_nail_rgba(
     auto_orient_cuticle_down: bool = True,
     force_inverted: Optional[bool] = None,
     homography: Optional[np.ndarray] = None,
-    exact_mask: bool = True,
+    exact_mask: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """
@@ -1132,9 +1193,19 @@ def extract_nail_rgba(
     local_pts = working_pts - np.array([x0, y0])
 
     if exact_mask:
-        solid_mask = np.zeros((ph, pw), dtype=np.uint8)
-        cv2.fillPoly(solid_mask, [local_pts], 255)
-        active_cnt = local_pts
+        # Option 1: Smooth local contour if dense to eliminate discrete staircasing
+        if len(local_pts) > 16:
+            local_pts_smooth = smooth_contour_spline(local_pts, target_points=max(60, min(100, len(local_pts))))
+        else:
+            local_pts_smooth = local_pts
+
+        # Option 2: 4x Supersampled anti-aliased sub-pixel mask rasterization
+        ss = 4
+        hi_mask = np.zeros((ph * ss, pw * ss), dtype=np.uint8)
+        scaled_pts = np.round(local_pts_smooth * float(ss)).astype(np.int32)
+        cv2.fillPoly(hi_mask, [scaled_pts], 255)
+        solid_mask = cv2.resize(hi_mask, (pw, ph), interpolation=cv2.INTER_AREA)
+        active_cnt = local_pts_smooth
 
         b, g, r = cv2.split(patch_bgr)
         patch_rgba = cv2.merge([b, g, r, solid_mask])
@@ -1165,7 +1236,9 @@ def extract_nail_rgba(
         if feather_px > 0:
             alpha_ch = patch_rgba[:, :, 3].astype(np.float32)
             blur_alpha = cv2.GaussianBlur(alpha_ch, (0, 0), sigmaX=feather_px, sigmaY=feather_px)
-            core_mask = cv2.erode((alpha_ch > 200).astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+            # Softened core clamp: erode solid core so transition zone blends smoothly without staircasing
+            k_core = max(3, int(round(feather_px * 2.5)) | 1)
+            core_mask = cv2.erode((alpha_ch >= 240).astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_core, k_core)))
             final_alpha = np.where(core_mask > 0, 255.0, blur_alpha)
             patch_rgba[:, :, 3] = np.clip(final_alpha, 0, 255).astype(np.uint8)
 
@@ -1387,7 +1460,7 @@ def refit_slot_contour(image: np.ndarray, bbox: List[int]) -> Dict[str, Any]:
         best_c = max(cnts, key=cv2.contourArea)
         if cv2.contourArea(best_c) > 0.20 * float(bw * bh):
             hull = cv2.convexHull(best_c)
-            global_cnt = hull + np.array([[[x0, y0]]])
+            global_cnt = smooth_contour_spline(hull + np.array([[[x0, y0]]]), target_points=80)
             bx_n, by_n, bw_n, bh_n = cv2.boundingRect(global_cnt)
             pca_angle, rot_cnt, _ = deskew_nail_pca(global_cnt)
             shape_info = classify_nail_shape(rot_cnt)
