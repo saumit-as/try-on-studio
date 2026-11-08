@@ -306,12 +306,13 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
     i_peak = int(np.clip(i_peak, max(4, int(0.45 * nail_h)), min(nail_h - 5, int(0.72 * nail_h))))
     w_eq = max(2.0, float(w_pre[i_peak]))
 
-    # Analyze tip flattening ratio in the distal 3% - 15% zone
-    tip_zone_start = max(1, int(0.03 * nail_h))
-    tip_zone_end = max(tip_zone_start + 1, int(0.15 * nail_h))
+    # Analyze tip flattening ratio in the distal 1% - 5% zone (NOT 3% - 15%!)
+    tip_zone_start = max(1, int(0.01 * nail_h))
+    tip_zone_end = max(tip_zone_start + 1, int(0.05 * nail_h))
     w_tip_measured = float(np.median(w_pre[tip_zone_start:tip_zone_end]))
     flat_ratio = w_tip_measured / w_eq
-    is_flat_tip = flat_ratio >= 0.55  # Square, Squoval, Coffin
+    # Only classify as flat-tip if the very top 1-5% is at least 72% as wide as the equator!
+    is_flat_tip = flat_ratio >= 0.72
 
     if not is_flat_tip:
         # -------------------------------------------------------------
@@ -377,16 +378,22 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
                 w_mono[nail_h - cut_cap_len] * ellip_cut[::-1],
             )
 
-        # Distal tip: preserve flat edge width and shoulder corners
-        tip_corner_len = max(2, int(0.035 * float(nail_h)))
-        if flat_ratio < 0.78:
-            # Squoval / Coffin: slight shoulder radius
+        # Distal tip: smooth 6% shoulder radius so there is never a sharp horizontal corner step
+        tip_corner_len = max(3, int(0.06 * float(nail_h)))
+        if tip_corner_len < nail_h:
             t_corn = np.linspace(0.0, 1.0, tip_corner_len, dtype=np.float64)
             corn_round = np.sqrt(np.clip(1.0 - (1.0 - t_corn) ** 2, 0.0, 1.0))
-            w_mono[:tip_corner_len] = np.minimum(w_mono[:tip_corner_len], w_tip_measured * corn_round)
-        else:
-            # Square: sharp orthogonal tip edge
-            w_mono[:tip_corner_len] = np.maximum(w_mono[:tip_corner_len], w_tip_measured * 0.96)
+            if flat_ratio < 0.85:
+                # Squoval / Coffin: smooth anatomical shoulder arch
+                w_mono[:tip_corner_len] = np.minimum(w_mono[:tip_corner_len], w_tip_measured * corn_round)
+            else:
+                # Square: gentle 3% corner easing
+                sq_corn = max(2, int(0.03 * float(nail_h)))
+                t_sq = np.linspace(0.0, 1.0, sq_corn, dtype=np.float64)
+                w_mono[:sq_corn] = np.minimum(
+                    w_mono[:sq_corn],
+                    w_tip_measured * np.sqrt(np.clip(1.0 - (1.0 - t_sq) ** 2, 0.0, 1.0))
+                )
 
         ys_scan = np.arange(y_min, y_max + 1, dtype=np.float64)
         left_pts = np.column_stack([center_x - w_mono, ys_scan])[::-1]
@@ -557,7 +564,12 @@ def is_nail_inverted(contour: np.ndarray, patch_rgba: Optional[np.ndarray] = Non
     score_extreme = top_extreme_w / max(1.0, bot_extreme_w)
     score_quarter = upper_quarter_w / max(1.0, lower_quarter_w)
 
-    if (score_extreme > 1.04) or (score_quarter > 1.03):
+    # If bottom is substantially wider than top, nail is right-side up (pointing up)
+    if score_extreme < 0.88 and score_quarter < 0.90:
+        return False
+
+    # Commercial press-on trays mount nails with cuticle at top (inverted) unless clearly pointing up
+    if (score_extreme >= 0.94) or (score_quarter >= 0.95):
         return True
 
     if patch_rgba is not None and patch_rgba.shape[0] >= 20:
@@ -572,7 +584,7 @@ def is_nail_inverted(contour: np.ndarray, patch_rgba: Optional[np.ndarray] = Non
             if abs(top_lum - bot_lum) > 35.0 and top_lum > bot_lum:
                 return True
 
-    return False
+    return True  # Default to inverted for commercial packaging trays
 
 
 def classify_nail_shape(contour: np.ndarray, force_inverted: Optional[bool] = None) -> Dict[str, Any]:
