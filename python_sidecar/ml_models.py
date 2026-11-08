@@ -371,9 +371,9 @@ class MobileSAMRunner:
 
         shape_info = classify_nail_shape(nail_cnt_orig)
 
-        # Recompute exact tight bounding box in corner format
+        # Recompute exact tight bounding box in [x, y, w, h] format
         bx, by, nbw, nbh = cv2.boundingRect(nail_cnt_orig)
-        tight_bbox = [int(bx), int(by), int(bx + nbw), int(by + nbh)]
+        tight_bbox = [int(bx), int(by), int(nbw), int(nbh)]
 
         return {
             "contour": nail_cnt_orig.reshape(-1, 2).tolist(),
@@ -428,7 +428,7 @@ class MobileSAMRunner:
             "slot_id": int(slot_id) if slot_id is not None else 1,
             "method": "classical",
             "contour": nail_cnt_orig.reshape(-1, 2).tolist(),
-            "bbox": [int(bx), int(by), int(bx + nbw), int(by + nbh)],
+            "bbox": [int(bx), int(by), int(nbw), int(nbh)],
             "shape_info": shape_info,
             "mask_id": "",
             "metrics": {

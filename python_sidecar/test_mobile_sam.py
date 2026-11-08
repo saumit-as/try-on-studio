@@ -220,9 +220,8 @@ def test_jsonrpc_handler():
     assert result["slot_id"] == 2
     assert result["method"] == "sam"
     assert len(result["contour"]) > 0
-    assert len(result["bbox"]) == 4
-    assert result["bbox"][0] < result["bbox"][2]
-    assert result["bbox"][1] < result["bbox"][3]
+    assert result["bbox"][2] > 0  # positive width
+    assert result["bbox"][3] > 0  # positive height
     assert "metrics" in result
     assert "decoder_ms" in result["metrics"]
     assert "refine_ms" in result["metrics"]

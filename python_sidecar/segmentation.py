@@ -13,12 +13,18 @@ Implements:
   - Observability: every slot reports "method" ("yolo" | "classical") and "method_note"
 """
 
+import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import scipy.ndimage
 import scipy.signal
+
+# Ensure local imports (ml_models, etc.) work regardless of cwd
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 
 def order_quad_points(pts: np.ndarray) -> np.ndarray:
@@ -648,6 +654,12 @@ def segment_packaging_tray(
                         s_refined["method"] = "sam"
                         s_refined["method_note"] = "MobileSAM zero-shot contour refinement"
                         s_refined["metrics"] = sam_res.get("metrics", {})
+                        if "shape_info" in sam_res:
+                            s_refined["shape_info"] = sam_res["shape_info"]
+                        cnt_arr = np.array(sam_res["contour"], dtype=np.int32)
+                        s_refined["area"] = round(float(cv2.contourArea(cnt_arr)), 1)
+                        bx, by, bw, bh = sam_res["bbox"]
+                        s_refined["aspect_ratio"] = round(float(bh / max(1, bw)), 3)
                         sam_slots.append(s_refined)
                     else:
                         sam_slots.append(s)
@@ -1066,7 +1078,7 @@ def extract_nail_rgba(
     auto_orient_cuticle_down: bool = True,
     force_inverted: Optional[bool] = None,
     homography: Optional[np.ndarray] = None,
-    exact_mask: bool = False,
+    exact_mask: bool = True,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """

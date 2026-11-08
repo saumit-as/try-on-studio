@@ -367,6 +367,7 @@ def run_set(
                 "deskew": True,
                 "auto_orient_cuticle_down": True,
                 "force_inverted": s.get("shape_info", {}).get("metrics", {}).get("is_inverted", None),
+                "exact_mask": True,
             }
             if pass_h and s.get("homography") is not None:
                 kwargs["homography"] = np.array(s["homography"], dtype=np.float64)
