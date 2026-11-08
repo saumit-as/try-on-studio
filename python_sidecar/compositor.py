@@ -78,10 +78,13 @@ def clean_tray_glare_preserving_texture(nail_rgba: np.ndarray) -> np.ndarray:
     # Catches both bright white ticks AND soft lightbox streaks on dark/colored nails
     med_L: float = float(np.median(L_chan[valid]))
     med_S: float = float(np.median(sat[valid]))
-    rel_L_spike = (tophat_L > 12.0) & (L_chan > min(185.0, med_L + 28.0))
-    rel_S_drop = (sat < max(38.0, med_S * 0.72))
+    # Glare must ALWAYS be significantly brighter than the nail's median luminance (med_L)!
+    L_glare_thresh = max(165.0, min(242.0, med_L + 20.0))
+    L_expand_thresh = max(150.0, min(230.0, med_L + 11.0))
+    rel_L_spike = (tophat_L > 10.0) & (L_chan > L_glare_thresh)
+    rel_S_drop = (sat < max(30.0, med_S * 0.65))
     glare_seed: np.ndarray = valid & rel_L_spike & rel_S_drop
-    glare_expand: np.ndarray = valid & (tophat_L > 6.0) & (L_chan > min(160.0, med_L + 16.0)) & (sat < max(48.0, med_S * 0.85))
+    glare_expand: np.ndarray = valid & (tophat_L > 5.0) & (L_chan > L_expand_thresh) & (sat < max(42.0, med_S * 0.80))
 
     # Condition 3 & 4: Connected component geometric isolation
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(glare_expand.astype(np.uint8))
@@ -153,6 +156,11 @@ def clean_tray_glare_preserving_texture(nail_rgba: np.ndarray) -> np.ndarray:
             ring_ys = np.where(edge_ring)[0][is_card_bleed]
             ring_xs = np.where(edge_ring)[1][is_card_bleed]
             out[ring_ys, ring_xs, :3] = nearest_bgr[is_card_bleed]
+
+    exterior_all: np.ndarray = alpha < 200
+    if np.any(clean_interior) and np.any(exterior_all):
+        _, (iy, ix) = scipy.ndimage.distance_transform_edt(~clean_interior, return_indices=True)
+        out[:, :, :3][exterior_all] = out[:, :, :3][iy[exterior_all], ix[exterior_all]]
 
     return out
 
@@ -234,17 +242,12 @@ def composite_nail_pbr(
     lighting_options: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Executes the 6-pass True-Texture PBR studio relighting and compositing pipeline on a warped nail ROI.
-
-    Key improvements (Steps 3 & 4):
-      - 3D Cylindrical Diffuse Ratio constrained to [0.84, 1.04]: center dome |u|<0.55 stays at
-        0.97-1.03 (preserving 100% original color/pattern contrast), with smooth cosine roll-off
-        to 0.84 on the shaded sidewall and 0.90 on the lit sidewall.
-      - 0.88 gentle contact AO tuck at the proximal cuticle base.
-      - Sheer nail-bed translucency restricted to max 10%, only where v_map < 0.62 AND local texture
-        variance std(L) in 9x9 is low (< 4.0), preventing washout of floral art, charms, or French tips.
-      - Adaptive clear-coat specular sheen: scales spec_alpha by 0.55 when interior luminance std is high.
-      - Dynamic lighting_options support (glossIntensity, shadowDepth, lightAngle, preset).
+    Natural Studio Retoucher Compositing Pipeline:
+      - Zero black perimeter fringe (edge shading fades to 1.0 at the outer boundary so anti-aliased
+        pixels never darken against the skin).
+      - Warm subsurface shading (never muddy gray/black scalar multiplication).
+      - Subtle, photography-preserving studio sheen (no metallic white pipe bar).
+      - No exterior black drop-shadow halo along sidewalls or cuticles.
     """
     rx, ry, rw, rh = bbox
     if rw <= 0 or rh <= 0:
@@ -267,148 +270,113 @@ def composite_nail_pbr(
         cuticle_right=target["c_r"],
         distal_left=target["d_l"],
         distal_right=target["d_r"],
-        feather_sigma=1.5,
+        feather_sigma=1.2,
     )
 
     tucked_alpha: np.ndarray = raw_alpha * pocket_allow
-    alpha_smooth: np.ndarray = cv2.GaussianBlur(tucked_alpha, (3, 3), 0.75)[:, :, None]
+    alpha_smooth: np.ndarray = cv2.GaussianBlur(tucked_alpha, (3, 3), 0.65)[:, :, None]
 
     # Pass 2: 3D Cylindrical & Longitudinal Apex Normals
     roll_offset: float = float(target.get("roll_offset", 0.0))
     u_map, v_map, nx, ny, nz = compute_3d_nail_geometry(tucked_alpha, roll_offset=roll_offset)
 
-    # Pass 3: Studio Diffuse Relighting & Sheer Subsurface Translucency
-    # Rotate key light around Y axis by light_angle_deg
-    rad: float = float(np.radians(light_angle_deg))
-    lx: float = 0.64 * np.cos(rad) + 0.755 * np.sin(rad)
-    lz: float = -0.64 * np.sin(rad) + 0.755 * np.cos(rad)
-    L_key: np.ndarray = np.array([lx, -0.14, lz], dtype=np.float32)
-    L_key /= np.linalg.norm(L_key)
-    ndotl_key: np.ndarray = np.clip(nx * L_key[0] + ny * L_key[1] + nz * L_key[2], 0.0, 1.0)
-
-    # Measure interior luminance and local spatial texture variation
+    # Measure interior luminance & contrast
     nail_lum: np.ndarray = 0.114 * warped_bgr[:, :, 0] + 0.587 * warped_bgr[:, :, 1] + 0.299 * warped_bgr[:, :, 2]
-    mean_L: np.ndarray = cv2.boxFilter(nail_lum, cv2.CV_32F, (9, 9))
-    mean_L2: np.ndarray = cv2.boxFilter(nail_lum ** 2, cv2.CV_32F, (9, 9))
-    local_std_L: np.ndarray = np.sqrt(np.maximum(0.0, mean_L2 - mean_L ** 2))
-
-    interior_bool: np.ndarray = tucked_alpha > 0.35
+    interior_bool: np.ndarray = tucked_alpha > 0.50
+    med_nail_lum: float = float(np.median(nail_lum[interior_bool])) if np.any(interior_bool) else 160.0
     interior_lum_std: float = float(np.std(nail_lum[interior_bool])) if np.any(interior_bool) else 15.0
-
-    # Sheer Translucency: Restricted strictly to the proximal nail bed zone (v_map < 0.62)
-    v_bed_zone: np.ndarray = np.clip((0.62 - v_map) / 0.15, 0.0, 1.0)
-    low_texture_var: np.ndarray = np.clip((4.0 - local_std_L) / 1.5, 0.0, 1.0)
-    sheer_weight: np.ndarray = 0.10 * v_bed_zone * low_texture_var
 
     hand_patch: np.ndarray = hand_orig[ry:ry + rh, rx:rx + rw].astype(np.float32)
     hand_bed_smooth: np.ndarray = cv2.GaussianBlur(hand_patch, (19, 19), 5.0)
-    base_with_subsurface: np.ndarray = (
-        warped_bgr * (1.0 - sheer_weight[:, :, None]) + hand_bed_smooth * sheer_weight[:, :, None]
-    )
 
-    # 3D Cylindrical Diffuse Ratio: Deepen edge shading to [0.72, 1.04]
-    center_diffuse: np.ndarray = 0.97 + 0.06 * ndotl_key
+    # Pass 3: Subtle Subsurface Warmth on Sheer/Light Nails (v_map < 0.65)
+    v_bed_zone: np.ndarray = np.clip((0.65 - v_map) / 0.20, 0.0, 1.0)
+    sheer_weight: np.ndarray = 0.08 * v_bed_zone
+    base_bgr: np.ndarray = warped_bgr * (1.0 - sheer_weight[:, :, None]) + hand_bed_smooth * sheer_weight[:, :, None]
+
+    # CRITICAL FIX FOR BLACK FRINGE:
+    # 1. Keep cylindrical C-curve shading gentle (max 8% darkening, i.e. 0.92..1.02) so light pastel nails
+    #    never get dark brown/black sidewalls.
+    # 2. Multiply shading intensity by `interior_fade = np.clip((tucked_alpha - 0.60) / 0.35, 0.0, 1.0)`
+    #    so the outer 1.5px anti-aliased boundary has ZERO artificial darkening (shading == 1.0 at the edge!).
     u_abs: np.ndarray = np.abs(u_map)
-    t_side: np.ndarray = np.clip((u_abs - 0.42) / 0.58, 0.0, 1.0)
+    t_side: np.ndarray = np.clip((u_abs - 0.45) / 0.55, 0.0, 1.0)
     w_side: np.ndarray = 0.5 * (1.0 - np.cos(np.pi * t_side))
-    target_sidewall: np.ndarray = np.where(u_map < 0.0, 0.72, 0.78)
-    diffuse_ratio: np.ndarray = np.where(
-        u_abs <= 0.42,
-        center_diffuse,
-        (1.0 - w_side) * 1.00 + w_side * target_sidewall,
-    )
-    diffuse_ratio = np.clip(diffuse_ratio, 0.72, 1.04)
+    raw_shading: np.ndarray = 1.01 - 0.09 * w_side  # Gently rolls off from 1.01 at center to 0.92 at sides
 
-    # Gentle 0.88 cuticle AO tuck at the proximal cuticle base
-    soft_cuticle_ao: np.ndarray = 0.88 + 0.12 * cuticle_ao
-    lit_bgr: np.ndarray = base_with_subsurface * (diffuse_ratio * soft_cuticle_ao)[:, :, None]
+    # Fade shading out at the very edge (tucked_alpha < 0.85) so the perimeter never turns into a dark line!
+    interior_fade: np.ndarray = np.clip((tucked_alpha - 0.60) / 0.35, 0.0, 1.0)
+    shading: np.ndarray = 1.0 - (1.0 - raw_shading) * interior_fade
 
-    # Pass 4: High-Gloss Clear Gel Topcoat Specular Reflections
-    # Aligned to upper-left studio softbox matching hand-template.jpg
-    spec_u_center: float = -0.22 - roll_offset * 0.35 + (light_angle_deg / 180.0) * 0.20
+    # Warm chromatic shading (darken Blue/Green slightly more than Red so shading is warm rose, never gray/black)
+    shade_bgr: np.ndarray = np.dstack([
+        shading ** 1.15,  # Blue
+        shading ** 1.05,  # Green
+        shading ** 0.85,  # Red (stays warmer)
+    ])
+    lit_bgr: np.ndarray = np.clip(base_bgr * shade_bgr, 0.0, 255.0)
+
+    # Pass 4: Delicate Studio Softbox Sheen (Avoids the "3D Metallic Pipe" look!)
+    spec_u_center: float = -0.20 - roll_offset * 0.30 + (light_angle_deg / 180.0) * 0.20
     u_delta: np.ndarray = u_map - spec_u_center
 
-    # Broad studio dome sheen
-    v_sheen_env: np.ndarray = np.sin(np.clip((v_map - 0.05) / 0.88, 0.0, 1.0) * np.pi)
-    broad_sheen: np.ndarray = np.exp(-0.5 * (u_delta / 0.18) ** 2) * v_sheen_env
+    v_sheen_env: np.ndarray = np.sin(np.clip((v_map - 0.08) / 0.82, 0.0, 1.0) * np.pi)
+    broad_sheen: np.ndarray = np.exp(-0.5 * (u_delta / 0.22) ** 2) * v_sheen_env
 
-    # Softened vertical softbox window reflection ribbon (rib_half_w = 0.065, exp = 1.6)
-    v_rib_in: np.ndarray = np.clip((v_map - 0.10) / 0.15, 0.0, 1.0)
-    v_rib_out: np.ndarray = np.clip((0.90 - v_map) / 0.12, 0.0, 1.0)
-    apex_hotspot: np.ndarray = 0.80 + 0.20 * np.exp(-0.5 * ((v_map - 0.48) / 0.22) ** 2)
-    v_rib_env: np.ndarray = (v_rib_in ** 1.2) * (v_rib_out ** 1.3) * apex_hotspot
+    rib_half_w: np.ndarray = 0.075 * (0.65 + 0.35 * v_sheen_env)
+    gloss_ribbon: np.ndarray = np.exp(-0.5 * (np.abs(u_delta) / np.maximum(0.015, rib_half_w)) ** 1.5) * v_sheen_env
 
-    rib_half_w: np.ndarray = 0.065 * (0.60 + 0.40 * np.sin(np.clip((v_map - 0.08) / 0.82, 0.0, 1.0) * np.pi))
-    gloss_ribbon: np.ndarray = np.exp(-0.5 * (np.abs(u_delta) / np.maximum(0.012, rib_half_w)) ** 1.6) * v_rib_env
-
-    # Secondary lateral fill sheen
-    fill_u_delta: np.ndarray = np.abs(u_map - (0.42 - roll_offset * 0.30))
-    fill_v_env: np.ndarray = np.maximum(0.0, np.sin(np.clip((v_map - 0.10) / 0.55, 0.0, 1.0) * np.pi)) ** 1.2
-    fill_reflection: np.ndarray = np.exp(-0.5 * (fill_u_delta / 0.075) ** 2.0) * fill_v_env
-
-    # Preset adaptations
+    # Keep synthetic gloss subtle because real tray photos already contain natural surface sheen
     if preset == "ring":
-        spec_total: np.ndarray = (0.25 * broad_sheen + 0.55 * gloss_ribbon + 0.20 * fill_reflection) * gloss_mult
+        spec_total: np.ndarray = (0.08 * broad_sheen + 0.22 * gloss_ribbon) * gloss_mult
     elif preset == "flash":
-        spec_total = (0.05 * broad_sheen + 1.10 * gloss_ribbon + 0.05 * fill_reflection) * gloss_mult
+        spec_total = (0.04 * broad_sheen + 0.32 * gloss_ribbon) * gloss_mult
     elif preset == "natural":
-        spec_total = (0.45 * broad_sheen + 0.30 * gloss_ribbon + 0.15 * fill_reflection) * gloss_mult
+        spec_total = (0.08 * broad_sheen + 0.10 * gloss_ribbon) * gloss_mult
     else:
-        # Studio default: gentle natural softbox sheen
-        spec_total = (0.10 * broad_sheen + 0.42 * gloss_ribbon + 0.08 * fill_reflection) * gloss_mult
+        # Studio default
+        spec_total = (0.06 * broad_sheen + 0.16 * gloss_ribbon) * gloss_mult
 
-    spec_total = cv2.GaussianBlur(spec_total, (3, 3), 0.5)
+    spec_total = cv2.GaussianBlur(spec_total, (5, 5), 1.0)
 
-    # Pillar 1d: Specular Perimeter Clamp (hybrid-implementation-v2.md)
-    # Clamps synthetic highlights to 0 within 2px of the silhouette
-    m_spec: np.ndarray = np.clip((tucked_alpha - 0.25) / 0.35, 0.0, 1.0)
-    spec_total = spec_total * m_spec
+    # Clamp specular strictly inside the solid interior (zero highlight within 3px of edge)
+    m_spec: np.ndarray = np.clip((tucked_alpha - 0.70) / 0.25, 0.0, 1.0)
+    spec_alpha: np.ndarray = np.clip(spec_total * m_spec, 0.0, 0.22)[:, :, None]
 
-    high_contrast_weight: float = float(np.clip((interior_lum_std - 18.0) / 10.0, 0.0, 1.0))
-    spec_scale: float = 1.0 - 0.45 * high_contrast_weight
+    # Screen blend mode (never over-additive, naturally softer on light pink/white nails!)
+    lit_bgr = lit_bgr + (250.0 - lit_bgr) * spec_alpha
 
-    spec_color: np.ndarray = np.array([252.0, 254.0, 255.0], dtype=np.float32)[None, None, :]
-    spec_alpha: np.ndarray = np.clip(spec_total[:, :, None] * spec_scale, 0.0, 0.85)
-    lit_bgr = lit_bgr * (1.0 - spec_alpha * 0.75) + spec_color * spec_alpha
-
-    # Pass 5: True Skin Light-Wrap & Warm Subsurface Crease Integration
-    hand_blurred: np.ndarray = cv2.GaussianBlur(hand_patch, (9, 9), 2.5)
+    # Pass 5: Cuticle & Sidewall Skin Light-Wrap (Melts the outer 1.5px nail edge into the surrounding skin)
+    # Never darken the skin sample! Use 100% skin brightness around the proximal cuticle & sidewalls.
+    hand_blurred: np.ndarray = cv2.GaussianBlur(hand_patch, (11, 11), 3.0)
     rim_wrap: np.ndarray = (
-        np.clip((1.0 - tucked_alpha) * 2.5, 0.0, 1.0)
+        np.clip((0.92 - tucked_alpha) * 2.2, 0.0, 1.0)
         * (tucked_alpha > 0.05)
-        * np.clip(1.0 - v_map * 1.4, 0.0, 1.0)
+        * np.clip(1.0 - v_map * 1.25, 0.0, 1.0)
     )
-    lit_bgr = lit_bgr * (1.0 - 0.22 * rim_wrap[:, :, None]) + hand_blurred * (0.22 * rim_wrap[:, :, None])
+    lit_bgr = lit_bgr * (1.0 - 0.28 * rim_wrap[:, :, None]) + hand_blurred * (0.28 * rim_wrap[:, :, None])
 
-    # Pass 6: Camera sensor micro-grain matching hand-template.jpg & under-tip cast shadow
+    # Pass 6: Sensor Micro-Grain ONLY inside the nail mask (fixes rectangular ROI box visibility!)
     rng: np.random.Generator = np.random.default_rng(seed=int(rx * 31 + ry * 17))
-    sensor_grain: np.ndarray = rng.normal(0.0, 1.15, size=(rh, rw, 1)).astype(np.float32)
-    lit_bgr = np.clip(lit_bgr + sensor_grain, 0.0, 255.0)
+    sensor_grain: np.ndarray = rng.normal(0.0, 1.0, size=(rh, rw, 1)).astype(np.float32)
+    lit_bgr = np.clip(lit_bgr + sensor_grain * alpha_smooth, 0.0, 255.0)
 
-    # Warm Subsurface Contact Shadow along the cuticle crease
-    valid_skin = (tucked_alpha < 0.15) & (hand_patch[:, :, 2] > 70.0)
-    if np.any(valid_skin):
-        skin_med_bgr = np.median(hand_patch[valid_skin], axis=0)
-    else:
-        skin_med_bgr = np.array([140.0, 155.0, 195.0], dtype=np.float32)
-    warm_shadow_bgr: np.ndarray = skin_med_bgr * np.array([0.52, 0.58, 0.72], dtype=np.float32)
-
-    crease_band: np.ndarray = np.clip((1.0 - cuticle_ao) / 0.18, 0.0, 1.0) * (tucked_alpha < 0.35) * np.clip(1.0 - v_map * 2.5, 0.0, 1.0)
+    # Gentle Warm Skin Crease Micro-Shadow (Max 6% warm darkening right in the cuticle tuck, NEVER black!)
     hand_curr: np.ndarray = composite_hand[ry:ry + rh, rx:rx + rw].copy()
-    hand_curr = hand_curr * (1.0 - 0.40 * crease_band[:, :, None]) + warm_shadow_bgr[None, None, :] * (0.40 * crease_band[:, :, None])
+    crease_weight: np.ndarray = (
+        np.clip((1.0 - cuticle_ao) / 0.18, 0.0, 1.0)
+        * (tucked_alpha < 0.50)
+        * np.clip(1.0 - v_map * 2.2, 0.0, 1.0)
+        * (0.06 * shadow_mult)
+    )
+    crease_mult_bgr: np.ndarray = np.dstack([
+        1.0 - crease_weight * 1.25,  # Warm shadow (absorbs blue)
+        1.0 - crease_weight * 1.10,  # Absorbs green
+        1.0 - crease_weight * 0.70,  # Preserves red subsurface warmth
+    ])
+    hand_with_shadow: np.ndarray = hand_curr * crease_mult_bgr
 
-    # Under-Tip Free-Edge Cast Shadow: RESTRICTED STRICTLY TO v_map > 0.65
-    M_sh: np.ndarray = np.float32([[1.0, 0.0, 1.6 + light_angle_deg * 0.05], [0.0, 1.0, 4.2]])
-    tip_zone_mask: np.ndarray = np.clip((v_map - 0.65) / 0.15, 0.0, 1.0)
-    shifted_alpha: np.ndarray = cv2.warpAffine(tucked_alpha * tip_zone_mask, M_sh, (rw, rh), flags=cv2.INTER_LINEAR)
-    shadow_blur: np.ndarray = cv2.GaussianBlur(shifted_alpha, (11, 11), 3.2)
-
-    patch_hsv: np.ndarray = cv2.cvtColor(hand_patch.astype(np.uint8), cv2.COLOR_BGR2HSV)
-    skin_weight: np.ndarray = np.clip((patch_hsv[:, :, 1].astype(np.float32) - 18.0) / 25.0, 0.0, 1.0)
-    under_shadow_mult: np.ndarray = 1.0 - (0.32 * shadow_mult) * shadow_blur * (1.0 - tucked_alpha) * skin_weight
-    hand_with_shadow: np.ndarray = hand_curr * under_shadow_mult[:, :, None]
-
-    # Sub-pixel anti-aliased composite
+    # Final sub-pixel anti-aliased composite
     composite_hand[ry:ry + rh, rx:rx + rw] = (
         lit_bgr * alpha_smooth + hand_with_shadow * (1.0 - alpha_smooth)
     )
