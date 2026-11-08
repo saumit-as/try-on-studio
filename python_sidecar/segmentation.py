@@ -6,14 +6,18 @@ Implements:
   - Step 1: Backing card perspective rectification (rectify_backing_card)
   - Step 2.1: Multi-cue foreground detection for white French tips, sheer cuticles & angled tray
   - Step 2.2: Data-driven bilateral profile smoothing with monotonic envelopes (build_symmetric_smooth_nail_mask)
-  - Extra A: Minimal 2px-3px edge-fringe cleanup with zero interior pixel fabrication
+  - Extra A: Edge de-matting (adaptive inward choke + soft feather + radial color bleed)
+    so card-contaminated bevel colors never reach the composite (dematte_nail_edges)
   - Extra B: Geometric shape classification including Squoval (classify_nail_shape)
   - Coordinate contract: homography transformation and card_quad preservation
+  - Observability: every slot reports "method" ("yolo" | "classical") and "method_note"
 """
 
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
+import scipy.ndimage
 import scipy.signal
 
 
@@ -564,13 +568,18 @@ def segment_packaging_tray(
     rect_img, H, card_quad = rectify_backing_card(image)
     h_img, w_img = rect_img.shape[:2]
 
-    # Check for fine-tuned ML segmentation model
+    # Check for fine-tuned ML segmentation model.
+    # No silent fallback: whichever path runs, every slot carries "method" and "method_note"
+    # so the UI and tests can see exactly why the ML path was or was not used.
+    ml_note: str = "ml model not loaded"
     try:
         from ml_models import get_model_manager
         ml_mgr = get_model_manager()
         if ml_mgr.has_tray_model():
             ml_slots = ml_mgr.segment_tray_ml(rect_img)
-            if ml_slots and len(ml_slots) >= 5:
+            n_ml: int = len(ml_slots) if ml_slots else 0
+            ml_note = f"yolo returned {n_ml} slots (< 5 required); using classical"
+            if ml_slots and n_ml >= 5:
                 H_inv = np.linalg.inv(H) if H is not None else None
                 final_slots = []
                 for s in ml_slots[:max_slots]:
@@ -597,12 +606,35 @@ def segment_packaging_tray(
                         "shape_info": shape_info,
                         "homography": H.tolist() if H is not None else None,
                         "card_quad": card_quad.tolist() if card_quad is not None else None,
+                        "method": "yolo",
+                        "method_note": f"yolo returned {n_ml} slots",
                     })
                 if len(final_slots) >= 5:
                     return final_slots
     except Exception as e:
-        pass
+        ml_note = f"ml error: {type(e).__name__}: {e}; using classical"
+        print(f"[segmentation] {ml_note}", file=sys.stderr)
 
+    classical_slots: List[Dict[str, Any]] = _segment_packaging_tray_classical(
+        rect_img, H, card_quad, max_slots
+    )
+    for s in classical_slots:
+        s["method"] = "classical"
+        s["method_note"] = ml_note
+    return classical_slots
+
+
+def _segment_packaging_tray_classical(
+    rect_img: np.ndarray,
+    H: np.ndarray,
+    card_quad: Optional[np.ndarray],
+    max_slots: int,
+) -> List[Dict[str, Any]]:
+    """
+    Classical multi-cue foreground segmentation on the rectified tray image.
+    Returns slots with contours and bboxes mapped back to ORIGINAL image coordinates.
+    """
+    h_img, w_img = rect_img.shape[:2]
     gray: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2GRAY)
     hsv: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2HSV)
     lab: np.ndarray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2LAB)
@@ -904,6 +936,92 @@ def segment_packaging_tray(
     return results
 
 
+def dematte_nail_edges(
+    patch_rgba: np.ndarray,
+    metrics_out: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """
+    Removes white backing-card contamination from the nail edge (hybrid-implementation-v2.md, Pillar 1).
+
+    The milky halo is a COLOR problem: the curved plastic bevel mirrors the white card, so edge
+    pixels carry card-white RGB that alpha feathering blends over skin. This function:
+
+      1a. Adaptive inward choke: r = clip(round(0.012 * nail_w), 1, 3) px grayscale erosion of alpha.
+          Area guard: if the choke removes > 4% of the alpha >= 128 silhouette, r is reduced by 1.
+      1b. Soft feather: Gaussian (sigma 0.8 px) on the choked alpha, clamped to never exceed the
+          original alpha, so the edge stays soft (needed by the compositor's specular clamp).
+      1c. Radial color bleed: every non-core pixel (alpha < 220, INCLUDING alpha == 0) receives the
+          color of its nearest solid-core pixel (Euclidean distance transform indices), lightly
+          blurred (sigma 1.0 px) to avoid flat bands on glitter/chrome.
+          Filling alpha == 0 pixels too means later resampling (deskew rotation, TPS warp, resize)
+          can never pull card-white colors back into the edge.
+
+    Solid-core pixels (final alpha >= 220) remain byte-identical to the source photo.
+
+    Args:
+        patch_rgba: uint8 BGRA nail cutout.
+        metrics_out: optional dict that receives choke_px, area_removed_pct and core_px.
+
+    Returns:
+        New uint8 BGRA array with de-matted edges.
+    """
+    out: np.ndarray = patch_rgba.copy()
+    alpha: np.ndarray = out[:, :, 3].astype(np.float32)
+    silhouette: np.ndarray = alpha >= 128.0
+    area0: int = int(np.sum(silhouette))
+    if area0 < 16:
+        if metrics_out is not None:
+            metrics_out.update({"choke_px": 0, "area_removed_pct": 0.0, "core_px": 0})
+        return out
+
+    xs: np.ndarray = np.where(silhouette)[1]
+    nail_w: float = float(xs.max() - xs.min() + 1)
+
+    # 1a. Adaptive inward choke with 4% area guard
+    choke_px: int = int(np.clip(round(0.012 * nail_w), 1, 3))
+    choked: np.ndarray = alpha
+    area_removed: float = 0.0
+    while choke_px >= 1:
+        k_size: int = 2 * choke_px + 1
+        kernel: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        candidate: np.ndarray = cv2.erode(alpha, kernel)
+        candidate_removed: float = 1.0 - float(np.sum(candidate >= 128.0)) / float(area0)
+        if candidate_removed <= 0.04:
+            choked = candidate
+            area_removed = candidate_removed
+            break
+        choke_px -= 1
+    if choke_px < 1:
+        choke_px = 0
+        choked = alpha
+        area_removed = 0.0
+
+    # 1b. Soft feather, never exceeding the original alpha
+    feathered: np.ndarray = cv2.GaussianBlur(choked, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    final_alpha: np.ndarray = np.minimum(feathered, alpha)
+
+    # 1c. Radial color bleed from the solid core
+    core: np.ndarray = final_alpha >= 220.0
+    if not np.any(core):
+        core = final_alpha >= 128.0
+    if np.any(core):
+        _, (iy, ix) = scipy.ndimage.distance_transform_edt(~core, return_indices=True)
+        bled: np.ndarray = out[:, :, :3][iy, ix].astype(np.float32)
+        bled_blur: np.ndarray = cv2.GaussianBlur(bled, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        non_core: np.ndarray = ~core
+        out[:, :, :3][non_core] = np.clip(bled_blur[non_core], 0.0, 255.0).astype(np.uint8)
+
+    out[:, :, 3] = np.clip(final_alpha, 0.0, 255.0).astype(np.uint8)
+
+    if metrics_out is not None:
+        metrics_out.update({
+            "choke_px": int(choke_px),
+            "area_removed_pct": round(100.0 * float(area_removed), 2),
+            "core_px": int(np.sum(core)),
+        })
+    return out
+
+
 def extract_nail_rgba(
     image: np.ndarray,
     contour: np.ndarray,
@@ -913,6 +1031,7 @@ def extract_nail_rgba(
     force_inverted: Optional[bool] = None,
     homography: Optional[np.ndarray] = None,
     exact_mask: bool = False,
+    metrics_out: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """
     Extracts an isolated, 100% solid, B-spline curve-smoothed RGBA nail cutout
@@ -922,9 +1041,11 @@ def extract_nail_rgba(
     into the rectified fronto-parallel plane at full source resolution and extracts
     the nail there, ensuring true aspect ratio and zero distortion.
     
-    Uses data-driven bilateral profile smoothing with monotonic envelopes and
-    applies a minimal 2px-3px edge-fringe cleanup so zero white card background
-    leaks into anti-aliased edges, keeping interior RGB 100% byte-identical.
+    Uses data-driven bilateral profile smoothing with monotonic envelopes, then de-mattes
+    the edge (dematte_nail_edges) so zero white card background leaks into anti-aliased
+    edges, keeping solid interior RGB 100% byte-identical.
+
+    metrics_out (optional) receives the de-matting metrics (choke_px, area_removed_pct, core_px).
     """
     pts = np.array(contour, dtype=np.float64).reshape(-1, 2)
 
@@ -998,7 +1119,7 @@ def extract_nail_rgba(
             final_alpha = np.where(core_mask > 0, 255.0, blur_alpha)
             patch_rgba[:, :, 3] = np.clip(final_alpha, 0, 255).astype(np.uint8)
 
-        return patch_rgba
+        return dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
 
     hull = cv2.convexHull(local_pts)
     hull_mask = np.zeros((ph, pw), dtype=np.uint8)
@@ -1146,21 +1267,12 @@ def extract_nail_rgba(
     else:
         sym_alpha = build_symmetric_smooth_nail_mask(patch_rgba[:, :, 3], feather_px=feather_px)
 
-    # Step Extra A: Minimal edge-fringe cleanup with zero interior pixel fabrication
-    # Inpaint only the outer boundary ring (where sym_alpha > 0 but outside eroded core)
-    # Interior core pixels remain 100% byte-identical to source photo.
-    core_mask = (patch_rgba[:, :, 3] > 200).astype(np.uint8)
-    fringe_px = max(3, int(round(patch_rgba.shape[1] * 0.045)))
-    erode_fringe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    core_eroded = cv2.erode(core_mask, erode_fringe, iterations=fringe_px)
-    if np.any(core_eroded > 0):
-        fringe_ring = ((sym_alpha > 0) & (core_eroded == 0)).astype(np.uint8) * 255
-        if np.any(fringe_ring > 0):
-            inpainted_rgb = cv2.inpaint(patch_rgba[:, :, :3], fringe_ring, inpaintRadius=float(max(3.0, fringe_px * 0.8)), flags=cv2.INPAINT_TELEA)
-            patch_rgba[:, :, :3][fringe_ring > 0] = inpainted_rgb[fringe_ring > 0]
-
+    # Step Extra A: Edge de-matting (adaptive choke + soft feather + radial color bleed).
+    # Runs after deskew/orientation, and fills every non-core pixel with nearest-core color,
+    # so no later resampling can reintroduce card-white edge colors.
+    # Solid interior core pixels remain 100% byte-identical to the source photo.
     patch_rgba[:, :, 3] = sym_alpha
-    return patch_rgba
+    return dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
 
 
 def refit_slot_contour(image: np.ndarray, bbox: List[int]) -> Dict[str, Any]:

@@ -359,6 +359,11 @@ def composite_nail_pbr(
 
     spec_total = cv2.GaussianBlur(spec_total, (3, 3), 0.5)
 
+    # Pillar 1d: Specular Perimeter Clamp (hybrid-implementation-v2.md)
+    # Clamps synthetic highlights to 0 within 2px of the silhouette
+    m_spec: np.ndarray = np.clip((tucked_alpha - 0.25) / 0.35, 0.0, 1.0)
+    spec_total = spec_total * m_spec
+
     high_contrast_weight: float = float(np.clip((interior_lum_std - 18.0) / 10.0, 0.0, 1.0))
     spec_scale: float = 1.0 - 0.45 * high_contrast_weight
 
@@ -412,14 +417,19 @@ def composite_nail_pbr(
 def erase_exposed_natural_nails(
     composite_canvas: np.ndarray,
     landmarks: Dict[str, Any],
+    mapped_nails_rgba: Optional[Dict[str, np.ndarray]] = None,
     downscale: float = 1.0,
 ) -> np.ndarray:
     """
-    Inpaints and heals exposed bare natural nail corners (especially square free edges
-    around d_l and d_r) with local skin tone and texture before press-on nails are composited.
+    Surgical, texture-preserving natural-nail inpainting (hybrid-implementation-v2.md, Pillar 5).
+    Evaluates per-side exposure (mL, mR) independently.
+    If neither corner is exposed (e.g. square/wide press-ons), inpainting is 100% skipped.
+    When exposed, strictly masks only the tiny lateral corner triangles at d_l and d_r,
+    leaving fingertip pulp, central nail bed, and cuticles completely untouched.
     """
     h_canvas, w_canvas = composite_canvas.shape[:2]
     nail_corners_mask = np.zeros((h_canvas, w_canvas), dtype=np.uint8)
+    has_any_inpaint = False
 
     for fname, lm in landmarks.items():
         if not isinstance(lm, dict) or "c_l" not in lm or "d_l" not in lm:
@@ -438,33 +448,70 @@ def erase_exposed_natural_nails(
         if np.dot(perp_u, d_r - d_l) < 0:
             perp_u = -perp_u
 
-        # Expand polygon slightly distal (+6px) and lateral (+4px)
-        p_d_ext = distal_mid + axis_u * (6.0 * downscale)
-        p_dl_ext = d_l + axis_u * (6.0 * downscale) - perp_u * (4.0 * downscale)
-        p_dr_ext = d_r + axis_u * (6.0 * downscale) + perp_u * (4.0 * downscale)
-        p_cl_ext = c_l - perp_u * (3.0 * downscale)
-        p_cr_ext = c_r + perp_u * (3.0 * downscale)
+        nat_distal_w = float(np.linalg.norm(d_r - d_l))
 
-        # Polygon covering the distal half and lateral corners of the natural nail bed
-        pts = np.array([
-            p_cl_ext + axis_u * (bed_len * 0.35),
-            p_dl_ext,
-            p_d_ext,
-            p_dr_ext,
-            p_cr_ext + axis_u * (bed_len * 0.35),
-        ], dtype=np.int32)
-        cv2.fillPoly(nail_corners_mask, [pts], 255)
+        # Check press-on nail width and shape if available
+        expose_left = False
+        expose_right = False
 
-    if np.any(nail_corners_mask > 0):
+        if mapped_nails_rgba and fname in mapped_nails_rgba:
+            nail_img = mapped_nails_rgba[fname]
+            if nail_img is not None and nail_img.size > 0:
+                n_alpha = nail_img[:, :, 3]
+                nh, nw = n_alpha.shape[:2]
+                # Measure taper at distal 40% zone
+                y_distal = int(nh * 0.42)
+                row_xs = np.where(n_alpha[min(y_distal, nh - 1)] > 50)[0]
+                if len(row_xs) > 0:
+                    press_distal_w = float(row_xs[-1] - row_xs[0] + 1) * downscale
+                    is_tapered = (nh / max(1.0, float(nw))) > 1.6
+                    margin = (nat_distal_w - press_distal_w) * 0.5
+                    if margin > 2.0 or is_tapered:
+                        expose_left = True
+                        expose_right = True
+                else:
+                    expose_left = True
+                    expose_right = True
+        else:
+            expose_left = True
+            expose_right = True
+
+        # Build surgical triangular corner masks strictly at d_l and d_r
+        corner_len = min(bed_len * 0.28, 14.0 * downscale)
+
+        if expose_left:
+            # Triangular wedge at d_l corner only
+            tri_l = np.array([
+                d_l,
+                d_l + axis_u * (2.0 * downscale),
+                d_l - perp_u * (2.0 * downscale) - axis_u * corner_len,
+            ], dtype=np.int32)
+            cv2.fillPoly(nail_corners_mask, [tri_l], 255)
+            has_any_inpaint = True
+
+        if expose_right:
+            # Triangular wedge at d_r corner only
+            tri_r = np.array([
+                d_r,
+                d_r + axis_u * (2.0 * downscale),
+                d_r + perp_u * (2.0 * downscale) - axis_u * corner_len,
+            ], dtype=np.int32)
+            cv2.fillPoly(nail_corners_mask, [tri_r], 255)
+            has_any_inpaint = True
+
+    if has_any_inpaint and np.any(nail_corners_mask > 0):
         canvas_u8 = np.clip(composite_canvas, 0, 255).astype(np.uint8)
         inpainted_bgr = cv2.inpaint(
             canvas_u8,
             nail_corners_mask,
-            inpaintRadius=max(3.0, 5.0 * downscale),
+            inpaintRadius=max(2.0, 3.5 * downscale),
             flags=cv2.INPAINT_TELEA,
         )
-        feather_mask = cv2.GaussianBlur(nail_corners_mask.astype(np.float32) / 255.0, (7, 7), 2.0)[:, :, None]
-        composite_canvas = composite_canvas * (1.0 - feather_mask) + inpainted_bgr.astype(np.float32) * feather_mask
+        noise = np.random.default_rng(42).normal(0.0, 1.2, canvas_u8.shape).astype(np.float32)
+        inpainted_textured = np.clip(inpainted_bgr.astype(np.float32) + noise, 0.0, 255.0)
+
+        feather_mask = cv2.GaussianBlur(nail_corners_mask.astype(np.float32) / 255.0, (5, 5), 1.2)[:, :, None]
+        composite_canvas = composite_canvas * (1.0 - feather_mask) + inpainted_textured * feather_mask
 
     return composite_canvas
 
@@ -506,8 +553,8 @@ def render_full_hand_composite(
     if not cleaned_nails:
         return hand_work
 
-    # Pre-composite: Inpaint exposed natural nail corners on bare hand template
-    composite_canvas = erase_exposed_natural_nails(composite_canvas, landmarks, downscale)
+    # Pre-composite: Surgical, texture-preserving inpainting of exposed natural nail corners
+    composite_canvas = erase_exposed_natural_nails(composite_canvas, landmarks, cleaned_nails, downscale)
 
     finger_keys = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
     hand_bed_widths = []
