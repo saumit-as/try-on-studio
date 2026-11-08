@@ -220,19 +220,19 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
             measured_half_w[i] = measured_half_w[i - 1] if i > 0 else 0.0
 
     # Pre-smooth measured_half_w before finding the equator and monotonic envelope
-    win_pre = max(5, int(nail_h * 0.11) | 1)
+    win_pre = max(5, int(nail_h * 0.09) | 1)
     if 5 <= win_pre < nail_h:
-        w_pre = scipy.signal.savgol_filter(measured_half_w, window_length=win_pre, polyorder=min(3, win_pre - 1))
+        w_pre = scipy.signal.savgol_filter(measured_half_w, window_length=win_pre, polyorder=min(2, win_pre - 1))
         w_pre = np.maximum(0.0, w_pre)
     else:
         w_pre = measured_half_w.copy()
 
-    # Locate the anatomical equator in the lower-middle zone [0.58 * nail_h, 0.66 * nail_h]
-    eq_start = int(0.58 * nail_h)
-    eq_end = max(eq_start + 1, int(0.66 * nail_h))
+    # Locate the anatomical equator in the mid-lower zone [0.45 * nail_h, 0.72 * nail_h]
+    eq_start = int(0.45 * nail_h)
+    eq_end = max(eq_start + 1, int(0.72 * nail_h))
     eq_zone = w_pre[eq_start:eq_end]
-    i_peak = eq_start + int(np.argmax(eq_zone)) if len(eq_zone) > 0 else int(0.63 * nail_h)
-    i_peak = int(np.clip(i_peak, max(4, int(0.58 * nail_h)), min(nail_h - 5, int(0.66 * nail_h))))
+    i_peak = eq_start + int(np.argmax(eq_zone)) if len(eq_zone) > 0 else int(0.58 * nail_h)
+    i_peak = int(np.clip(i_peak, max(4, int(0.45 * nail_h)), min(nail_h - 5, int(0.72 * nail_h))))
     w_eq = max(2.0, float(w_pre[i_peak]))
 
     # Analyze tip flattening ratio in the distal 3% - 15% zone
@@ -244,7 +244,7 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
 
     if not is_flat_tip:
         # -------------------------------------------------------------
-        # ALMOND / OVAL / STILETTO: G2 Continuous Super-Ellipse Arch
+        # ALMOND / OVAL / STILETTO: Slender Taper & True Tip Preservation
         # -------------------------------------------------------------
         w_mono = w_pre.copy()
         for i in range(1, i_peak + 1):
@@ -254,93 +254,27 @@ def build_symmetric_smooth_nail_mask(mask: np.ndarray, feather_px: float = 1.5) 
             if w_mono[i] < w_mono[i + 1]:
                 w_mono[i] = w_mono[i + 1]
 
-        u_tip = np.linspace(1.0, 0.0, i_peak + 1, dtype=np.float64)
-        target_upper = np.clip(w_mono[: i_peak + 1] / w_eq, 0.0, 1.0)
-        fit_mask_up = (u_tip >= 0.12) & (u_tip <= 0.86)
-        best_err_up = float("inf")
-        best_p_up, best_q_up = 1.82, 2.18
-        if np.any(fit_mask_up):
-            u_sub = u_tip[fit_mask_up]
-            t_sub = target_upper[fit_mask_up]
-            for p_cand in np.linspace(1.80, 3.40, 21):
-                base_curve = np.clip(1.0 - (u_sub ** p_cand), 1e-6, 1.0)
-                for q_cand in np.linspace(2.12, 2.65, 14):
-                    pred = base_curve ** (1.0 / q_cand)
-                    prior = 0.0008 * ((p_cand - 1.82) ** 2 + (q_cand - 2.18) ** 2)
-                    err = float(np.mean((pred - t_sub) ** 2)) + prior
-                    if err < best_err_up:
-                        best_err_up = err
-                        best_p_up = float(p_cand)
-                        best_q_up = float(q_cand)
-
-        w_upper_analytic = w_eq * (np.clip(1.0 - (u_tip ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
-
-        n_lower = nail_h - i_peak
-        u_cut = np.linspace(0.0, 1.0, n_lower, dtype=np.float64)
-        target_lower = np.clip(w_mono[i_peak:] / w_eq, 0.0, 1.0)
-        fit_mask_low = (u_cut >= 0.12) & (u_cut <= 0.82)
-        best_err_low = float("inf")
-        best_p_low, best_q_low = 2.05, 2.40
-        if np.any(fit_mask_low):
-            u_sub_l = u_cut[fit_mask_low]
-            t_sub_l = target_lower[fit_mask_low]
-            for p_cand in np.linspace(2.00, 2.45, 10):
-                base_curve = np.clip(1.0 - (u_sub_l ** p_cand), 1e-6, 1.0)
-                for q_cand in np.linspace(2.30, 2.65, 9):
-                    pred = base_curve ** (1.0 / q_cand)
-                    prior = 0.0008 * ((p_cand - 2.05) ** 2 + (q_cand - 2.40) ** 2)
-                    err = float(np.mean((pred - t_sub_l) ** 2)) + prior
-                    if err < best_err_low:
-                        best_err_low = err
-                        best_p_low = float(p_cand)
-                        best_q_low = float(q_cand)
-
-        w_lower_analytic = w_eq * (np.clip(1.0 - (u_cut ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
-        w_analytic = np.concatenate([w_upper_analytic[:-1], w_lower_analytic])
-
-        win_len = max(7, int(nail_h * 0.25) | 1)
-        if 7 <= win_len < nail_h:
-            w_smooth = scipy.signal.savgol_filter(w_mono, window_length=win_len, polyorder=3)
-            w_smooth = np.maximum(0.0, w_smooth)
-        else:
-            w_smooth = w_mono.copy()
-
-        tip_cap_len = max(4, int(0.14 * float(nail_h)))
+        # Top tip: only cap the top 4% (matching local slope) so Almond/Stiletto stay slender
+        tip_cap_len = max(2, int(0.04 * float(nail_h)))
         if tip_cap_len < nail_h:
             t_cap = np.linspace(0.0, 1.0, tip_cap_len, dtype=np.float64)
             ellip_tip = np.sqrt(np.clip(1.0 - (1.0 - t_cap) ** 2, 0.0, 1.0))
-            w_smooth[:tip_cap_len] = np.minimum(w_smooth[:tip_cap_len], w_smooth[tip_cap_len - 1] * ellip_tip)
+            w_mono[:tip_cap_len] = np.minimum(w_mono[:tip_cap_len], w_mono[tip_cap_len] * ellip_tip)
+        w_mono[0] = 0.0
 
-        cut_cap_len = max(5, int(0.16 * float(nail_h)))
+        # Bottom cuticle: anatomical U-cup rounding on the bottom 14%
+        cut_cap_len = max(4, int(0.14 * float(nail_h)))
         if cut_cap_len < nail_h:
             t_cut = np.linspace(0.0, 1.0, cut_cap_len, dtype=np.float64)
             ellip_cut = np.sqrt(np.clip(1.0 - (1.0 - t_cut) ** 2, 0.0, 1.0))
-            w_smooth[nail_h - cut_cap_len :] = np.minimum(
-                w_smooth[nail_h - cut_cap_len :],
-                w_smooth[nail_h - cut_cap_len] * ellip_cut[::-1],
+            w_mono[nail_h - cut_cap_len :] = np.minimum(
+                w_mono[nail_h - cut_cap_len :],
+                w_mono[nail_h - cut_cap_len] * ellip_cut[::-1],
             )
 
-        theta_up = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
-        u_tip_dense = np.cos(theta_up)
-        y_up_dense = float(y_min) + (1.0 - u_tip_dense) * float(i_peak)
-        w_up_analytic_dense = w_eq * (np.clip(1.0 - (u_tip_dense ** best_p_up), 0.0, 1.0) ** (1.0 / best_q_up))
-        w_up_smooth_dense = np.interp(y_up_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
-        w_up_dense = 0.94 * w_up_analytic_dense + 0.06 * w_up_smooth_dense
-
-        theta_low = np.linspace(0.0, 0.5 * np.pi, 120, dtype=np.float64)
-        u_cut_dense = np.sin(theta_low)
-        y_low_dense = float(y_min + i_peak) + u_cut_dense * float(max(1, nail_h - 1 - i_peak))
-        w_low_analytic_dense = w_eq * (np.clip(1.0 - (u_cut_dense ** best_p_low), 0.0, 1.0) ** (1.0 / best_q_low))
-        w_low_smooth_dense = np.interp(y_low_dense - float(y_min), np.arange(nail_h, dtype=np.float64), w_smooth)
-        w_low_dense = 0.94 * w_low_analytic_dense + 0.06 * w_low_smooth_dense
-
-        ys_dense = np.concatenate([y_up_dense[:-1], y_low_dense])
-        half_w_dense = np.concatenate([w_up_dense[:-1], w_low_dense])
-        half_w_dense[0] = 0.0
-        half_w_dense[-1] = 0.0
-
-        left_pts = np.column_stack([center_x - half_w_dense, ys_dense])[::-1]
-        right_pts = np.column_stack([center_x + half_w_dense, ys_dense])
+        ys_scan = np.arange(y_min, y_max + 1, dtype=np.float64)
+        left_pts = np.column_stack([center_x - w_mono, ys_scan])[::-1]
+        right_pts = np.column_stack([center_x + w_mono, ys_scan])
         poly_pts = np.vstack([left_pts, right_pts])
 
     else:
@@ -1216,12 +1150,13 @@ def extract_nail_rgba(
     # Inpaint only the outer boundary ring (where sym_alpha > 0 but outside eroded core)
     # Interior core pixels remain 100% byte-identical to source photo.
     core_mask = (patch_rgba[:, :, 3] > 200).astype(np.uint8)
+    fringe_px = max(3, int(round(patch_rgba.shape[1] * 0.045)))
     erode_fringe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    core_eroded = cv2.erode(core_mask, erode_fringe, iterations=2)
+    core_eroded = cv2.erode(core_mask, erode_fringe, iterations=fringe_px)
     if np.any(core_eroded > 0):
         fringe_ring = ((sym_alpha > 0) & (core_eroded == 0)).astype(np.uint8) * 255
         if np.any(fringe_ring > 0):
-            inpainted_rgb = cv2.inpaint(patch_rgba[:, :, :3], fringe_ring, inpaintRadius=3.0, flags=cv2.INPAINT_TELEA)
+            inpainted_rgb = cv2.inpaint(patch_rgba[:, :, :3], fringe_ring, inpaintRadius=float(max(3.0, fringe_px * 0.8)), flags=cv2.INPAINT_TELEA)
             patch_rgba[:, :, :3][fringe_ring > 0] = inpainted_rgb[fringe_ring > 0]
 
     patch_rgba[:, :, 3] = sym_alpha

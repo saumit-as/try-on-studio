@@ -69,7 +69,26 @@ def apply_cylindrical_c_curve(
             map_x = np.where(inside, centers[:, None] + u_tex * radii[:, None], x_grid)
 
     # Global 3D lateral yaw/roll perspective foreshortening for 3/4 profile thumb
-    if abs(roll_offset) > 0.01:
+    if abs(roll_offset) > 0.10:
+        # 3D Horizon Occlusion: thumbnail turned in lateral profile has its far 24% occluded behind nail barrel
+        u_occ = float(np.clip(0.24 * (abs(roll_offset) / 0.35), 0.08, 0.32))
+        theta_max = 0.5 * np.pi * max(0.6, min(1.0, c_curve_intensity * 1.3))
+        x_lin = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        if roll_offset < 0:
+            # Left side is far horizon, turning away from camera
+            theta = (1.0 - x_lin) * theta_max
+            x_proj = (1.0 - np.cos(theta)) / max(1e-5, (1.0 - np.cos(theta_max)))
+            x_vis = 1.0 - x_proj
+            src_u = u_occ + x_vis * (1.0 - u_occ)
+        else:
+            # Right side is far horizon
+            theta = x_lin * theta_max
+            x_proj = (1.0 - np.cos(theta)) / max(1e-5, (1.0 - np.cos(theta_max)))
+            src_u = x_proj * (1.0 - u_occ)
+
+        map_x = np.clip(src_u * float(w - 1), 0.0, float(w - 1))
+        map_x = np.tile(map_x[None, :], (h, 1)).astype(np.float32)
+    elif abs(roll_offset) > 0.01:
         x_norm = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :]
         gamma = float(np.power(2.0, -roll_offset * 1.35))
         x_rolled = np.power(np.clip(x_norm, 0.0, 1.0), gamma) * (w - 1)
@@ -89,6 +108,12 @@ def apply_cylindrical_c_curve(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0) if has_alpha else (0, 0, 0),
     )
+    if has_alpha and abs(roll_offset) > 0.10:
+        # Crisp 1.0px anti-aliased drop-off at the 3D silhouette horizon
+        if roll_offset < 0:
+            warped[:, 0, 3] = np.clip(warped[:, 0, 3].astype(np.float32) * 0.70, 0, 255).astype(np.uint8)
+        else:
+            warped[:, -1, 3] = np.clip(warped[:, -1, 3].astype(np.float32) * 0.70, 0, 255).astype(np.uint8)
     return warped
 
 
@@ -190,7 +215,8 @@ def build_3tier_control_grid(
 
     # Nail-bed half-width adjusted by width_scale
     w_mult = max(0.4, min(2.5, float(width_scale)))
-    frame_half_w = bed_width * 0.545 * w_mult
+    frame_half_w = bed_width * 0.495 * w_mult
+    distal_half_w = min(frame_half_w, distal_width * 0.50 * w_mult)
 
     # Preserve each nail's true length from the tray image
     user_mult = max(0.2, min(3.0, float(length_scale))) if length_scale is not None else 1.0
@@ -204,27 +230,37 @@ def build_3tier_control_grid(
         else:
             extension_dist = max(bed_length * 1.34 * user_mult, auto_total_len)
 
-    if abs(roll_offset) > 0.05:
-        # 3/4 lateral profile thumb adjustment
-        base_left = c_c - perp_unit * (frame_half_w * 0.92)
-        base_right = c_c + perp_unit * (frame_half_w * 0.98)
-        apex_center = c_c + axis_unit * (extension_dist * 0.50)
-        apex_left = apex_center - perp_unit * (frame_half_w * 0.95)
-        apex_right = apex_center + perp_unit * (frame_half_w * 1.02)
-    else:
-        # Strictly orthogonal rectangle aligned to (axis_unit, perp_unit)
-        # Preserves 100% of the extracted nail's G2-smooth ovoid/almond silhouette!
-        base_left = c_c - perp_unit * frame_half_w
-        base_right = c_c + perp_unit * frame_half_w
-        apex_center = c_c + axis_unit * (extension_dist * 0.50)
-        apex_left = apex_center - perp_unit * frame_half_w
-        apex_right = apex_center + perp_unit * frame_half_w
-
-    # Row 3: Extended free-edge tip frame
+    # Row 2 placed at distal nail-bed crease (s = 0.42 * extension_dist) matching distal_width * 0.50
+    apex_center = c_c + axis_unit * (extension_dist * 0.42)
     tip_center = c_c + axis_unit * extension_dist
     tip_half_w = frame_half_w * tip_taper
-    tip_left = tip_center - perp_unit * tip_half_w
-    tip_right = tip_center + perp_unit * tip_half_w
+
+    if abs(roll_offset) > 0.10:
+        # 3/4 lateral profile thumb: horizon side shifted inward by 0.72, near side by 0.95
+        if roll_offset < 0:
+            # Horizon on left, near skin on right
+            base_left = c_c - perp_unit * (frame_half_w * 0.72)
+            base_right = c_c + perp_unit * (frame_half_w * 0.95)
+            apex_left = apex_center - perp_unit * (distal_half_w * 0.72)
+            apex_right = apex_center + perp_unit * (distal_half_w * 0.95)
+            tip_left = tip_center - perp_unit * (tip_half_w * 0.72)
+            tip_right = tip_center + perp_unit * (tip_half_w * 0.95)
+        else:
+            # Horizon on right, near skin on left
+            base_left = c_c - perp_unit * (frame_half_w * 0.95)
+            base_right = c_c + perp_unit * (frame_half_w * 0.72)
+            apex_left = apex_center - perp_unit * (distal_half_w * 0.95)
+            apex_right = apex_center + perp_unit * (distal_half_w * 0.72)
+            tip_left = tip_center - perp_unit * (tip_half_w * 0.95)
+            tip_right = tip_center + perp_unit * (tip_half_w * 0.72)
+    else:
+        # Strictly orthogonal rectangle aligned to (axis_unit, perp_unit)
+        base_left = c_c - perp_unit * frame_half_w
+        base_right = c_c + perp_unit * frame_half_w
+        apex_left = apex_center - perp_unit * distal_half_w
+        apex_right = apex_center + perp_unit * distal_half_w
+        tip_left = tip_center - perp_unit * tip_half_w
+        tip_right = tip_center + perp_unit * tip_half_w
 
     dst_pts = np.array([
         # Row 1: Cuticle base frame (s = 0.0)
@@ -288,18 +324,18 @@ def build_cuticle_pocket_mask(
     cuticle_w = float(np.linalg.norm(c_r - c_l))
     bed_w = max(distal_w, cuticle_w)
 
-    # Match the pocket width to the nail's equator width (`0.555 * bed_w`) at s_eq = 0.38
-    # and form a G1-tangent semi-elliptical U-cup around c_c so there is NEVER a sharp corner at c_l/c_r!
-    pocket_half_w = bed_w * 0.565
-    s_eq = 0.38 * bed_len
+    # Flatter squoval U-cup with s_eq = 0.18 * bed_len matching natural squoval cuticle contours
+    pocket_half_w = cuticle_w * 0.505
+    s_eq = 0.18 * bed_len
 
-    # Semi-elliptical U-cup from left equator (theta = pi) through c_c (theta = pi/2) to right equator (theta = 0)
+    # Squoval U-cup from left equator (theta = pi) through c_c (theta = pi/2) to right equator (theta = 0)
     thetas = np.linspace(np.pi, 0.0, 45, dtype=np.float64)
     eq_center = c_c + axis_unit * s_eq
+    sin_term = np.power(np.maximum(0.0, np.sin(thetas)), 0.75)
     u_cup_pts = (
         eq_center[None, :]
-        + ( np.cos(thetas) * pocket_half_w)[:, None] * perp_unit[None, :]
-        - (np.sin(thetas) * s_eq)[:, None] * axis_unit[None, :]
+        + (np.cos(thetas) * pocket_half_w)[:, None] * perp_unit[None, :]
+        - (sin_term * s_eq)[:, None] * axis_unit[None, :]
     )
 
     # Above s_eq, flare smoothly outward so the upper nail body and free-edge tip are 100% unclipped
