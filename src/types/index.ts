@@ -126,6 +126,7 @@ export interface HandTemplate {
   aoMapSrc?: string;
   specularMapSrc?: string;
   isDefault?: boolean;
+  detectionMethod?: "mediapipe" | "cv";
 }
 
 export interface HandOverlayToggles {

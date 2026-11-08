@@ -6,3 +6,4 @@ pytoshop>=1.2.1
 six>=1.16.0
 packbits>=0.6
 pyinstaller>=6.0.0
+mediapipe>=1.0.0

@@ -19,6 +19,52 @@ from typing import Dict, Any, Tuple, Optional, List
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
+REPO_ROOT = os.path.abspath(os.path.join(current_dir, ".."))
+
+_MP_DETECTOR = None
+
+def _get_hand_landmarker_path() -> Optional[str]:
+    """Resolves the MediaPipe hand_landmarker.task model path across dev and packaged distributions."""
+    candidates = [
+        os.path.join(REPO_ROOT, "models", "hand_landmarker.task"),
+        os.path.join(current_dir, "..", "models", "hand_landmarker.task"),
+        os.path.join(current_dir, "models", "hand_landmarker.task"),
+        os.path.join(getattr(sys, "_MEIPASS", ""), "models", "hand_landmarker.task") if hasattr(sys, "_MEIPASS") else "",
+        os.path.join(os.path.dirname(sys.executable), "models", "hand_landmarker.task"),
+        os.path.join(os.path.dirname(sys.executable), "hand_landmarker.task"),
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return os.path.abspath(p)
+    return None
+
+def get_mediapipe_hand_detector():
+    """Returns a singleton MediaPipe HandLandmarker instance, or None if unavailable."""
+    global _MP_DETECTOR
+    if _MP_DETECTOR is not None:
+        return _MP_DETECTOR
+
+    try:
+        from mediapipe.tasks.python import vision, BaseOptions
+    except ImportError:
+        return None
+
+    model_path = _get_hand_landmarker_path()
+    if not model_path or not os.path.exists(model_path):
+        return None
+
+    try:
+        options = vision.HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            num_hands=1,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+        )
+        _MP_DETECTOR = vision.HandLandmarker.create_from_options(options)
+        return _MP_DETECTOR
+    except Exception as ex:
+        print(f"[mediapipe] Failed to initialize HandLandmarker: {ex}", file=sys.stderr)
+        return None
 
 from warping import build_cuticle_pocket_mask
 
@@ -482,8 +528,117 @@ def init_default_studio_template(repo_root: str):
     print(f"Initialized webview template at: {pub_dir}")
 
 
-def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "auto") -> Dict[str, Any]:
+def detect_hand_landmarks_mediapipe(
+    hand_bgr: np.ndarray,
+    handedness_hint: str = "auto",
+) -> Optional[Dict[str, Any]]:
     """
+    Detects hand 3D skeletal landmarks using MediaPipe HandLandmarker.
+    Extracts precise 5-point nail landmarks for all 5 fingers along with
+    handedness and palm center/radius.
+    Returns None if detection fails or MediaPipe is unavailable.
+    """
+    detector = get_mediapipe_hand_detector()
+    if detector is None:
+        return None
+
+    try:
+        import mediapipe as mp
+        h, w = hand_bgr.shape[:2]
+        rgb = cv2.cvtColor(hand_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = detector.detect(mp_img)
+
+        if not res.hand_landmarks or len(res.hand_landmarks) == 0:
+            return None
+
+        lms = res.hand_landmarks[0]
+        detected_handedness = "left"
+        if res.handedness and len(res.handedness) > 0 and len(res.handedness[0]) > 0:
+            detected_handedness = res.handedness[0][0].category_name.lower()
+
+        handedness = handedness_hint if handedness_hint in ("left", "right") else detected_handedness
+
+        pts = np.array([[lm.x * w, lm.y * h] for lm in lms], dtype=np.float64)
+
+        finger_joints = {
+            "Thumb": (3, 4),   # IP, TIP
+            "Index": (7, 8),   # DIP, TIP
+            "Middle": (11, 12),
+            "Ring": (15, 16),
+            "Pinky": (19, 20),
+        }
+
+        landmarks: Dict[str, Dict[str, Any]] = {}
+        for fname, (dip_idx, tip_idx) in finger_joints.items():
+            dip = pts[dip_idx]
+            tip = pts[tip_idx]
+            is_thumb = (fname == "Thumb")
+
+            bone_v = tip - dip
+            bone_len = float(np.linalg.norm(bone_v))
+            bone_u = bone_v / max(1e-4, bone_len)
+
+            perp_u = np.array([-bone_u[1], bone_u[0]], dtype=np.float64)
+            if perp_u[0] < 0:
+                perp_u = -perp_u
+
+            if is_thumb:
+                nail_w = bone_len * 0.28
+                distal_mid = tip + bone_u * (bone_len * 0.38)
+                c_c = tip - bone_u * (bone_len * 0.24)
+                c_curve = 0.52
+                roll_offset = -0.45 if handedness == "right" else 0.45
+                tip_taper = 0.92
+                length_scale = 0.95
+            else:
+                nail_w = bone_len * 0.50
+                distal_mid = tip + bone_u * (bone_len * 0.40)
+                c_c = tip - bone_u * (bone_len * 0.42)
+                c_curve = 0.28
+                roll_offset = 0.0
+                tip_taper = 1.00
+                length_scale = 1.00
+
+            d_l = distal_mid - perp_u * (nail_w * 0.50)
+            d_r = distal_mid + perp_u * (nail_w * 0.50)
+            c_l = c_c - perp_u * (nail_w * 0.48)
+            c_r = c_c + perp_u * (nail_w * 0.48)
+
+            landmarks[fname] = {
+                "c_l": [round(float(c_l[0]), 1), round(float(c_l[1]), 1)],
+                "c_c": [round(float(c_c[0]), 1), round(float(c_c[1]), 1)],
+                "c_r": [round(float(c_r[0]), 1), round(float(c_r[1]), 1)],
+                "d_l": [round(float(d_l[0]), 1), round(float(d_l[1]), 1)],
+                "d_r": [round(float(d_r[0]), 1), round(float(d_r[1]), 1)],
+                "c_curve": c_curve,
+                "roll_offset": roll_offset,
+                "length_scale": length_scale,
+                "tip_taper": tip_taper,
+            }
+
+        wrist = pts[0]
+        mid_mcp = pts[9]
+        index_mcp = pts[5]
+        pinky_mcp = pts[17]
+        palm_c = wrist * 0.40 + mid_mcp * 0.30 + index_mcp * 0.15 + pinky_mcp * 0.15
+        palm_r = float(np.linalg.norm(mid_mcp - wrist) * 0.38)
+
+        return {
+            "landmarks": landmarks,
+            "handedness": handedness,
+            "palm_center": [int(palm_c[0]), int(palm_c[1])],
+            "palm_radius": palm_r,
+            "detection_method": "mediapipe",
+        }
+    except Exception as e:
+        print(f"[mediapipe] Error during detection: {e}", file=sys.stderr)
+        return None
+
+
+def _auto_detect_hand_landmarks_cv(hand_bgr: np.ndarray, handedness_hint: str = "auto") -> Dict[str, Any]:
+    """
+    Classical CV fallback:
     Automatically detects the hand, palm center, handedness (left vs right hand),
     and all 5 individual fingernail landmarks (Thumb, Index, Middle, Ring, Pinky).
     Uses a robust 2-stage anatomical decomposition:
@@ -666,6 +821,7 @@ def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "aut
             "handedness": handedness,
             "palm_center": [int(palm_x), int(palm_y)],
             "palm_radius": float(palm_r),
+            "detection_method": "cv",
         }
 
     # 5. Local Phalanx Medial Spine Fitting & Anatomical Nail Sizing
@@ -756,7 +912,22 @@ def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "aut
         "handedness": handedness,
         "palm_center": [int(palm_x), int(palm_y)],
         "palm_radius": float(palm_r),
+        "detection_method": "cv",
     }
+
+
+def auto_detect_hand_landmarks(hand_bgr: np.ndarray, handedness_hint: str = "auto") -> Dict[str, Any]:
+    """
+    Automatically detects the hand, palm center, handedness (left vs right hand),
+    and all 5 individual fingernail landmarks (Thumb, Index, Middle, Ring, Pinky).
+    Uses Google MediaPipe HandLandmarker for sub-pixel deep learning skeletal accuracy,
+    and seamlessly falls back to 2-stage anatomical CV decomposition if MediaPipe is unavailable.
+    """
+    mp_res = detect_hand_landmarks_mediapipe(hand_bgr, handedness_hint=handedness_hint)
+    if mp_res is not None:
+        return mp_res
+
+    return _auto_detect_hand_landmarks_cv(hand_bgr, handedness_hint=handedness_hint)
 
 
 def refit_finger_landmarks(
@@ -768,6 +939,8 @@ def refit_finger_landmarks(
     """
     Computes accurate 5-point nail landmarks within a user-drawn or detected
     bounding box [x, y, w, h] over any specific fingertip.
+    Uses MediaPipe if the detected finger landmark is within the bounding region,
+    falling back to contour morphology.
     """
     bx, by, bw, bh = bbox
     h, w = hand_bgr.shape[:2]
@@ -775,6 +948,25 @@ def refit_finger_landmarks(
     by = max(0, min(h - 1, int(by)))
     bw = max(10, min(w - bx, int(bw)))
     bh = max(10, min(h - by, int(bh)))
+
+    # Try MediaPipe detection first
+    mp_res = detect_hand_landmarks_mediapipe(hand_bgr, handedness_hint=handedness)
+    if mp_res and finger_name in mp_res.get("landmarks", {}):
+        flm = mp_res["landmarks"][finger_name]
+        cx, cy = flm["c_c"]
+        dx, dy = (flm["d_l"][0] + flm["d_r"][0]) * 0.5, (flm["d_l"][1] + flm["d_r"][1]) * 0.5
+        margin_x = bw * 0.75
+        margin_y = bh * 0.75
+        in_bbox = (
+            (bx - margin_x <= cx <= bx + bw + margin_x and by - margin_y <= cy <= by + bh + margin_y) or
+            (bx - margin_x <= dx <= bx + bw + margin_x and by - margin_y <= dy <= by + bh + margin_y)
+        )
+        if in_bbox:
+            return {
+                "finger_name": finger_name,
+                "landmarks": flm,
+                "detection_method": "mediapipe",
+            }
 
     roi = hand_bgr[by : by + bh, bx : bx + bw]
     ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
@@ -876,6 +1068,7 @@ def refit_finger_landmarks(
             "length_scale": 1.0,
             "tip_taper": 1.0,
         },
+        "detection_method": "cv",
     }
 
 

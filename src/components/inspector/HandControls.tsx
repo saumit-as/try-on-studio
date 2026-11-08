@@ -88,6 +88,7 @@ export const HandControls: React.FC<HandControlsProps> = ({
         handedness: "left" | "right";
         palm_center: [number, number];
         palm_radius: number;
+        detection_method?: "mediapipe" | "cv";
       }>("auto_detect_hand", {
         image_base64: src,
         handedness: targetHandedness,
@@ -107,6 +108,7 @@ export const HandControls: React.FC<HandControlsProps> = ({
                 handednessOverride ||
                 prev.currentTemplate.handedness ||
                 "left",
+              detectionMethod: res.detection_method || "mediapipe",
             },
           };
         });
@@ -552,19 +554,44 @@ export const HandControls: React.FC<HandControlsProps> = ({
           onClick={() => handleAutoDetectFingers()}
           disabled={isAutoDetecting}
           className="w-full py-2 bg-gradient-to-r from-amber-600/25 to-rose-600/25 hover:from-amber-600/40 hover:to-rose-600/40 text-amber-200 text-xs font-medium rounded-lg border border-amber-500/30 flex items-center justify-center gap-2 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+          title="Detect hand landmarks, palm center, and nail anchors using Google MediaPipe 3D Landmarker (with CV fallback)"
         >
           {isAutoDetecting ? (
             <>
               <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
-              Detecting Hand & Nails (CV)...
+              Detecting Hand & Nails (MediaPipe AI)...
             </>
           ) : (
             <>
-              <Wand2 className="w-3.5 h-3.5 text-amber-400" />
-              Auto-Detect Hand & Nails (CV)
+              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+              Auto-Detect Hand & Nails (MediaPipe AI)
             </>
           )}
         </button>
+
+        {currentTemplate?.detectionMethod && (
+          <div className="flex items-center justify-between px-2.5 py-1.5 bg-neutral-900/60 border border-neutral-800 rounded-lg text-[11px]">
+            <span className="text-neutral-400">Detection Rig</span>
+            <span
+              className={`flex items-center gap-1 font-medium ${
+                currentTemplate.detectionMethod === "mediapipe"
+                  ? "text-emerald-400"
+                  : "text-amber-400"
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  currentTemplate.detectionMethod === "mediapipe"
+                    ? "bg-emerald-400 animate-pulse"
+                    : "bg-amber-400"
+                }`}
+              />
+              {currentTemplate.detectionMethod === "mediapipe"
+                ? "MediaPipe 3D Skeletal AI"
+                : "Classical CV Segmenter"}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Finger Navigation Chips */}

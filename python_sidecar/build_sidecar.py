@@ -57,6 +57,11 @@ def main():
         "--distpath", str(binaries_dir),
         str(sidecar_dir / "main.py")
     ]
+
+    models_dir = repo_root / "models"
+    if models_dir.exists():
+        sep = ";" if "windows" in triplet else ":"
+        cmd.extend(["--add-data", f"{models_dir}{sep}models"])
     
     print("Running:", " ".join(cmd))
     res = subprocess.run(cmd, cwd=sidecar_dir)

@@ -454,7 +454,7 @@ def handle_load_hand_template(params):
 
 def handle_auto_detect_hand(params):
     """
-    Analyzes an arbitrary user hand photo using Computer Vision,
+    Analyzes an arbitrary user hand photo using MediaPipe AI (with CV fallback),
     automatically detects fingertips, palm center, handedness, and the 5-point nail landmarks.
     """
     img = _load_image(params)
@@ -466,6 +466,7 @@ def handle_auto_detect_hand(params):
         "handedness": res["handedness"],
         "palm_center": res["palm_center"],
         "palm_radius": res["palm_radius"],
+        "detection_method": res.get("detection_method", "mediapipe"),
     }
 
 
@@ -488,6 +489,7 @@ def handle_refit_finger(params):
         "status": "ok",
         "finger_name": res["finger_name"],
         "landmarks": res["landmarks"],
+        "detection_method": res.get("detection_method", "cv"),
     }
 
 
