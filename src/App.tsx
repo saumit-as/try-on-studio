@@ -51,6 +51,7 @@ export default function App() {
     slotInverted: {},
     shapeOverrides: {},
     extractedPreviews: {},
+    extractedDebug: {},
     hoveredSlot: null,
     isManualEditMode: false,
     originalSlots: {},

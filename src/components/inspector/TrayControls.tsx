@@ -16,8 +16,12 @@ import {
   X,
   ZoomIn,
   ZoomOut,
+  Bug,
+  Sparkles,
+  Download,
+  CheckCircle2,
 } from "lucide-react";
-import { FingerName, NailShape, TrayState, DetectedSlot } from "../../types";
+import { FingerName, NailShape, TrayState, DetectedSlot, ExtractionDebugInfo } from "../../types";
 import { callSidecar } from "../../services/sidecar";
 
 interface TrayControlsProps {
@@ -44,6 +48,11 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
   const [nudgeStep, setNudgeStep] = useState<number>(5);
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
   const [modalZoom, setModalZoom] = useState<number>(1);
+  const [forceExactMask, setForceExactMask] = useState<boolean>(true);
+  const [isRefiningSam, setIsRefiningSam] = useState<boolean>(false);
+  const [isDumpingDebug, setIsDumpingDebug] = useState<boolean>(false);
+  const [debugMessage, setDebugMessage] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(true);
 
   const {
     selectedSlot,
@@ -87,12 +96,14 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
       width: number;
       height: number;
       image_base64: string;
+      debug_info?: ExtractionDebugInfo;
     }>("extract_nail", {
       image_base64: trayState.trayImageSrc,
       contour: activeSlotData.contour,
+      slot_id: selectedSlot,
       deskew: true,
       auto_orient_cuticle_down: true,
-      exact_mask: isCustomContour,
+      exact_mask: forceExactMask || isCustomContour,
     })
       .then((ext) => {
         if (isMounted && ext && ext.status === "ok" && ext.image_base64) {
@@ -105,10 +116,18 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
               ...prev.extractedPreviews,
               [selectedSlot]: previewUrl,
             },
+            extractedDebug: ext.debug_info
+              ? {
+                  ...prev.extractedDebug,
+                  [selectedSlot]: ext.debug_info,
+                }
+              : prev.extractedDebug,
           }));
         }
       })
-      .catch(() => {})
+      .catch((err) => {
+        console.error(`[TrayControls] Auto-extraction error for slot #${selectedSlot}:`, err);
+      })
       .finally(() => {
         if (isMounted) {
           setIsLoadingPreview(false);
@@ -118,7 +137,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [trayState.trayImageSrc, selectedSlot, activeSlotData, extractedPreviews, setTrayState]);
+  }, [trayState.trayImageSrc, selectedSlot, activeSlotData, extractedPreviews, forceExactMask, setTrayState]);
 
   const handleSlotSelect = (slotId: number) => {
     setTrayState((prev) => ({ ...prev, selectedSlot: slotId }));
@@ -306,10 +325,11 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
     }
   };
 
-  // Re-extract fresh cutout from current contour with exact_mask
-  const handleReExtract = async () => {
+  // Re-extract fresh cutout from current contour with exact_mask or adaptive mask
+  const handleReExtract = async (overrideExactMask?: boolean, debugDump?: boolean) => {
     if (!trayState.trayImageSrc || !activeSlotData) return;
     setIsLoadingPreview(true);
+    const useExact = overrideExactMask !== undefined ? overrideExactMask : forceExactMask;
     try {
       const isCustomContour =
         !!(activeSlotData.pen_anchors && activeSlotData.pen_anchors.length > 0) ||
@@ -320,12 +340,15 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
         width: number;
         height: number;
         image_base64: string;
+        debug_info?: ExtractionDebugInfo;
       }>("extract_nail", {
         image_base64: trayState.trayImageSrc,
         contour: activeSlotData.contour,
+        slot_id: selectedSlot,
         deskew: true,
         auto_orient_cuticle_down: !isInverted,
-        exact_mask: isCustomContour || true,
+        exact_mask: isCustomContour || useExact,
+        debug_dump: !!debugDump,
       });
 
       if (ext && ext.status === "ok" && ext.image_base64) {
@@ -338,12 +361,86 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
             ...prev.extractedPreviews,
             [selectedSlot]: previewUrl,
           },
+          extractedDebug: ext.debug_info
+            ? {
+                ...prev.extractedDebug,
+                [selectedSlot]: ext.debug_info,
+              }
+            : prev.extractedDebug,
         }));
+
+        if (debugDump && ext.debug_info?.debug_dump_path) {
+          setDebugMessage(`Debug files dumped to: ${ext.debug_info.debug_dump_path}`);
+          setTimeout(() => setDebugMessage(null), 8000);
+        }
       }
     } catch (err) {
       console.error("Re-extract failed:", err);
     } finally {
       setIsLoadingPreview(false);
+    }
+  };
+
+  // 1-Click zero-shot contour refinement using MobileSAM
+  const handleRefineWithSam = async () => {
+    if (!trayState.trayImageSrc || !activeSlotData) return;
+    setIsRefiningSam(true);
+    try {
+      const bx = activeSlotData.bbox[0];
+      const by = activeSlotData.bbox[1];
+      const bw = activeSlotData.bbox[2];
+      const bh = activeSlotData.bbox[3];
+      const samRes = await callSidecar<{
+        status: string;
+        contour: [number, number][];
+        bbox: [number, number, number, number];
+        metrics?: Record<string, any>;
+      }>("segment_prompt", {
+        image_base64: trayState.trayImageSrc,
+        bbox: [bx, by, bx + bw, by + bh],
+        slot_id: selectedSlot,
+      });
+
+      if (samRes && samRes.status === "ok" && samRes.contour && samRes.contour.length > 5) {
+        setTrayState((prev) => {
+          const nextSlots = prev.detectedSlots.map((s) => {
+            if (s.slot_id === selectedSlot) {
+              return {
+                ...s,
+                contour: samRes.contour,
+                bbox: samRes.bbox || s.bbox,
+                method: "sam",
+                method_note: "MobileSAM zero-shot contour refinement",
+              };
+            }
+            return s;
+          });
+          return { ...prev, detectedSlots: nextSlots };
+        });
+
+        // Trigger immediate re-extraction with new contour
+        setTimeout(() => {
+          handleReExtract(true);
+        }, 50);
+        setDebugMessage("✓ Nail contour successfully refined with MobileSAM AI!");
+        setTimeout(() => setDebugMessage(null), 5000);
+      }
+    } catch (err) {
+      console.error("MobileSAM refinement failed:", err);
+    } finally {
+      setIsRefiningSam(false);
+    }
+  };
+
+  const handleDumpDebug = async () => {
+    if (!trayState.trayImageSrc || !activeSlotData) return;
+    setIsDumpingDebug(true);
+    try {
+      await handleReExtract(forceExactMask, true);
+    } catch (err) {
+      console.error("Debug dump failed:", err);
+    } finally {
+      setIsDumpingDebug(false);
     }
   };
 
@@ -505,6 +602,161 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Extraction Diagnostics & Debug Tools Section */}
+      {activeSlotData && (
+        <div className="p-3.5 bg-neutral-900/90 rounded-xl border border-neutral-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Bug className="w-3.5 h-3.5 text-amber-400" />
+              <span className="text-xs font-semibold text-neutral-200">
+                Extraction Diagnostics & Debug
+              </span>
+            </div>
+            <button
+              onClick={() => setShowDiagnostics((prev) => !prev)}
+              className="text-[11px] text-neutral-400 hover:text-neutral-200 cursor-pointer flex items-center gap-1"
+            >
+              <span>{showDiagnostics ? "Hide" : "Show"}</span>
+              <ChevronDown className={`w-3 h-3 transition-transform ${showDiagnostics ? "rotate-180" : ""}`} />
+            </button>
+          </div>
+
+          {debugMessage && (
+            <div className="p-2 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-300 flex items-center gap-2">
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+              <span className="truncate">{debugMessage}</span>
+            </div>
+          )}
+
+          {showDiagnostics && (
+            <div className="space-y-3 pt-1">
+              {/* Method & Quality Pill Header */}
+              <div className="flex items-center justify-between text-[11px] bg-neutral-950/70 p-2 rounded-lg border border-neutral-800/80">
+                <span className="text-neutral-400">Segmentation Method:</span>
+                <span
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold tracking-wide ${
+                    activeSlotData.method === "sam"
+                      ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                      : activeSlotData.method === "yolo"
+                      ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                      : activeSlotData.pen_anchors?.length
+                      ? "bg-purple-500/20 text-purple-400 border border-purple-500/30"
+                      : "bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                  }`}
+                >
+                  {activeSlotData.method === "sam"
+                    ? "MobileSAM AI"
+                    : activeSlotData.method === "yolo"
+                    ? "YOLO11 ML"
+                    : activeSlotData.pen_anchors?.length
+                    ? "Pen Tool"
+                    : "Classical CV"}
+                </span>
+              </div>
+
+              {/* Metrics Grid */}
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                <div className="p-2 bg-neutral-950/50 rounded-lg border border-neutral-800/60">
+                  <span className="text-neutral-500 block text-[10px]">Contour Vertices</span>
+                  <span className="text-neutral-200 font-mono font-medium">
+                    {activeSlotData.contour.length} points
+                  </span>
+                </div>
+                <div className="p-2 bg-neutral-950/50 rounded-lg border border-neutral-800/60">
+                  <span className="text-neutral-500 block text-[10px]">De-Matting Choke</span>
+                  <span className="text-neutral-200 font-mono font-medium">
+                    {trayState.extractedDebug?.[selectedSlot]?.dematting_metrics?.choke_px ?? 2} px (
+                    {trayState.extractedDebug?.[selectedSlot]?.dematting_metrics?.area_removed_pct ?? 0}%)
+                  </span>
+                </div>
+                <div className="p-2 bg-neutral-950/50 rounded-lg border border-neutral-800/60">
+                  <span className="text-neutral-500 block text-[10px]">Extraction Mode</span>
+                  <span className="text-amber-300 font-medium text-[10px]">
+                    {forceExactMask ? "Exact Shape Contour" : "Adaptive Super-Ellipse"}
+                  </span>
+                </div>
+                <div className="p-2 bg-neutral-950/50 rounded-lg border border-neutral-800/60">
+                  <span className="text-neutral-500 block text-[10px]">Orientation</span>
+                  <span className="text-neutral-200 font-medium text-[10px]">
+                    {isInverted ? "Cuticle Tucked (180°)" : "Standard Upright"}
+                  </span>
+                </div>
+              </div>
+
+              {/* Mask Strategy Switcher */}
+              <div className="space-y-1">
+                <span className="text-[10px] text-neutral-400 font-medium">Contour Mask Mode:</span>
+                <div className="grid grid-cols-2 gap-1.5 bg-neutral-950 p-1 rounded-lg border border-neutral-800">
+                  <button
+                    onClick={() => {
+                      setForceExactMask(true);
+                      handleReExtract(true);
+                    }}
+                    className={`py-1 px-2 rounded text-[10px] font-medium transition-all cursor-pointer ${
+                      forceExactMask
+                        ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    Exact Contour
+                  </button>
+                  <button
+                    onClick={() => {
+                      setForceExactMask(false);
+                      handleReExtract(false);
+                    }}
+                    className={`py-1 px-2 rounded text-[10px] font-medium transition-all cursor-pointer ${
+                      !forceExactMask
+                        ? "bg-amber-500 text-neutral-950 font-bold shadow-xs"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    Super-Ellipse
+                  </button>
+                </div>
+              </div>
+
+              {/* AI & Debug Trigger Buttons */}
+              <div className="space-y-1.5 pt-1">
+                <button
+                  onClick={handleRefineWithSam}
+                  disabled={isRefiningSam || isLoadingPreview}
+                  className="w-full py-2 px-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold text-xs rounded-lg flex items-center justify-center gap-2 cursor-pointer shadow-md transition-all disabled:opacity-50"
+                  title="Run zero-shot MobileSAM on this slot to snap tightly around the true nail silhouette"
+                >
+                  {isRefiningSam ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5 text-amber-200" />
+                  )}
+                  <span>{isRefiningSam ? "Refining with MobileSAM..." : "Refine Slot with MobileSAM AI"}</span>
+                </button>
+
+                <button
+                  onClick={handleDumpDebug}
+                  disabled={isDumpingDebug || isLoadingPreview}
+                  className="w-full py-1.5 px-3 bg-neutral-800 hover:bg-neutral-750 text-neutral-300 border border-neutral-700/80 rounded-lg text-xs font-medium flex items-center justify-center gap-2 cursor-pointer transition-all disabled:opacity-50"
+                  title="Export intermediate crop, deskewed mask, and JSON diagnostic metadata to test_output/debug_extractions/"
+                >
+                  {isDumpingDebug ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5 text-neutral-400" />
+                  )}
+                  <span>Export Debug Images & JSON</span>
+                </button>
+              </div>
+
+              {trayState.extractedDebug?.[selectedSlot]?.debug_dump_path && (
+                <div className="p-2 bg-neutral-950 rounded border border-neutral-800/80 text-[9px] font-mono text-neutral-400 break-all select-all">
+                  Dumped to: {trayState.extractedDebug[selectedSlot].debug_dump_path}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -904,7 +1156,7 @@ export const TrayControls: React.FC<TrayControlsProps> = ({
                   </button>
 
                   <button
-                    onClick={handleReExtract}
+                    onClick={() => handleReExtract()}
                     disabled={isLoadingPreview}
                     className="px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-750 text-amber-300 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer border border-neutral-700 transition-all disabled:opacity-50"
                     title="Re-extract fresh cutout from current contour (preserves all designs & black tips)"

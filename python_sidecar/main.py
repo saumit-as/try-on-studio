@@ -11,9 +11,11 @@ Persistent JSON-RPC stdio daemon handling:
 
 import sys
 import os
+import time
 import json
 import base64
 import traceback
+from typing import Dict, Any, List, Optional
 import cv2
 import numpy as np
 
@@ -93,27 +95,41 @@ def _load_image(params):
 
 
 def handle_segment_tray(params):
+    t0 = time.time()
     img = _load_image(params)
     max_slots = params.get("max_slots", 10)
-    slots = segment_packaging_tray(img, max_slots=max_slots)
+    refine_with_sam = bool(params.get("refine_with_sam", True))
+    slots = segment_packaging_tray(img, max_slots=max_slots, refine_with_sam=refine_with_sam)
+    elapsed_ms = round((time.time() - t0) * 1000.0, 1)
+    sys.stderr.write(
+        f"[segment_tray] Detected {len(slots)} slots in {elapsed_ms}ms "
+        f"(image size={img.shape[1]}x{img.shape[0]}, refine_with_sam={refine_with_sam})\n"
+    )
     return {
         "status": "ok",
         "slot_count": len(slots),
         "slots": slots,
         "image_size": [int(img.shape[1]), int(img.shape[0])],
+        "execution_time_ms": elapsed_ms,
     }
 
 
 def handle_extract_nail(params):
+    t0 = time.time()
     img = _load_image(params)
     contour = np.array(params["contour"], dtype=np.int32)
     feather_px = float(params.get("feather_px", 1.2))
     deskew = bool(params.get("deskew", True))
     auto_orient = bool(params.get("auto_orient_cuticle_down", True))
-    exact_mask = bool(params.get("exact_mask", False))
+    exact_mask = bool(params.get("exact_mask", True))
+    slot_id = int(params.get("slot_id", 1))
+    debug_dump = bool(params.get("debug_dump", False) or os.environ.get("TRYON_DEBUG") == "1")
+
     homography = None
     if "homography" in params and params["homography"] is not None:
         homography = np.array(params["homography"], dtype=np.float64)
+
+    metrics: Dict[str, Any] = {}
     rgba = extract_nail_rgba(
         img,
         contour,
@@ -122,6 +138,7 @@ def handle_extract_nail(params):
         auto_orient_cuticle_down=auto_orient,
         homography=homography,
         exact_mask=exact_mask,
+        metrics_out=metrics,
     )
 
     # Encode as PNG base64
@@ -129,12 +146,61 @@ def handle_extract_nail(params):
     if not success:
         raise ValueError("Failed to encode extracted nail to PNG")
     b64_str = base64.b64encode(buffer).decode("utf-8")
+    elapsed_ms = round((time.time() - t0) * 1000.0, 1)
+
+    dump_path = None
+    if debug_dump:
+        try:
+            dump_dir = os.path.join(REPO_ROOT, "test_output", "debug_extractions", f"slot_{slot_id}_{int(time.time()*1000)}")
+            os.makedirs(dump_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(dump_dir, "extracted_rgba.png"), rgba)
+            debug_meta = {
+                "slot_id": slot_id,
+                "width": int(rgba.shape[1]),
+                "height": int(rgba.shape[0]),
+                "metrics": metrics,
+                "contour_pts": len(contour),
+                "exact_mask": exact_mask,
+                "deskew": deskew,
+                "elapsed_ms": elapsed_ms,
+            }
+            with open(os.path.join(dump_dir, "debug_meta.json"), "w") as f:
+                json.dump(debug_meta, f, indent=2)
+            dump_path = dump_dir
+            sys.stderr.write(f"[extract_nail] Dumped debug assets to: {dump_dir}\n")
+        except Exception as e:
+            sys.stderr.write(f"[extract_nail] Warning: Failed to dump debug assets: {e}\n")
+
+    debug_info = {
+        "slot_id": slot_id,
+        "method": "exact_mask" if exact_mask else "classical_adaptive",
+        "contour_points": len(contour),
+        "width": int(rgba.shape[1]),
+        "height": int(rgba.shape[0]),
+        "deskew_angle": round(float(metrics.get("deskew_angle", 0.0)), 2),
+        "is_inverted": bool(metrics.get("is_inverted", False)),
+        "dematting_metrics": {
+            "choke_px": int(metrics.get("choke_px", 0)),
+            "area_removed_pct": float(metrics.get("area_removed_pct", 0.0)),
+            "core_px": int(metrics.get("core_px", 0)),
+        },
+        "crop_box": metrics.get("crop_box"),
+        "duration_ms": elapsed_ms,
+        "debug_dump_path": dump_path,
+    }
+
+    sys.stderr.write(
+        f"[extract_nail] slot={slot_id} -> ok: size=({rgba.shape[1]}x{rgba.shape[0]}), "
+        f"mode={'exact' if exact_mask else 'adaptive'}, deskew={debug_info['deskew_angle']}°, "
+        f"inv={debug_info['is_inverted']}, choke={debug_info['dematting_metrics']['choke_px']}px ({elapsed_ms}ms)\n"
+    )
 
     return {
         "status": "ok",
         "width": int(rgba.shape[1]),
         "height": int(rgba.shape[0]),
         "image_base64": f"data:image/png;base64,{b64_str}",
+        "debug_info": debug_info,
     }
 
 
@@ -580,24 +646,33 @@ def main():
             params = req.get("params", {})
 
             if method not in HANDLERS:
+                sys.stderr.write(f"[Sidecar RPC ERROR] Unknown method '{method}'\n")
                 response = {
                     "id": req_id,
                     "error": {"code": -32601, "message": f"Method '{method}' not found"}
                 }
             else:
+                t0_req = time.time()
                 try:
                     result = HANDLERS[method](params)
+                    elapsed_req = (time.time() - t0_req) * 1000.0
+                    if method not in ("ping", "echo"):
+                        sys.stderr.write(f"[Sidecar RPC] {method} -> OK ({elapsed_req:.1f}ms)\n")
                     response = {"id": req_id, "result": result}
                 except Exception as ex:
+                    elapsed_req = (time.time() - t0_req) * 1000.0
+                    tb = traceback.format_exc()
+                    sys.stderr.write(f"[Sidecar RPC EXCEPTION] {method} ({elapsed_req:.1f}ms): {ex}\n{tb}\n")
                     response = {
                         "id": req_id,
                         "error": {
                             "code": -32000,
                             "message": str(ex),
-                            "traceback": traceback.format_exc()
+                            "traceback": tb
                         }
                     }
         except Exception as e:
+            sys.stderr.write(f"[Sidecar JSON Parse ERROR]: {e}\n")
             response = {
                 "id": None,
                 "error": {"code": -32700, "message": f"Parse error: {str(e)}"}

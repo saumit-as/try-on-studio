@@ -25,7 +25,7 @@ import {
   X,
   Wand2,
 } from "lucide-react";
-import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor, HandState, LightingState } from "../../types";
+import { ActiveTab, TrayState, DetectedSlot, FingerName, PenAnchor, HandState, LightingState, ExtractionDebugInfo } from "../../types";
 import { callSidecar } from "../../services/sidecar";
 import { HandRigCanvas } from "./HandRigCanvas";
 import { CompositeCanvas } from "./CompositeCanvas";
@@ -320,6 +320,7 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
         segmentError: null,
         detectedSlots: [],
         extractedPreviews: {},
+        extractedDebug: {},
         shapeOverrides: {},
         nailRotation: {},
         slotInverted: {},
@@ -393,21 +394,19 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
 
   const fetchNailPreview = async (imageSrc: string, slot: DetectedSlot) => {
     try {
-      const isCustomContour =
-        !!(slot.pen_anchors && slot.pen_anchors.length > 0) ||
-        !!(trayState.slotPenAnchors?.[slot.slot_id] && trayState.slotPenAnchors[slot.slot_id].length > 0);
-
       const ext = await callSidecar<{
         status: string;
         width: number;
         height: number;
         image_base64: string;
+        debug_info?: ExtractionDebugInfo;
       }>("extract_nail", {
         image_base64: imageSrc,
         contour: slot.contour,
+        slot_id: slot.slot_id,
         deskew: true,
         auto_orient_cuticle_down: true,
-        exact_mask: isCustomContour,
+        exact_mask: true,
       });
 
       if (ext && ext.status === "ok" && ext.image_base64) {
@@ -419,10 +418,16 @@ export const CanvasViewport: React.FC<CanvasViewportProps> = ({
               ? ext.image_base64
               : `data:image/png;base64,${ext.image_base64}`,
           },
+          extractedDebug: ext.debug_info
+            ? {
+                ...prev.extractedDebug,
+                [slot.slot_id]: ext.debug_info,
+              }
+            : prev.extractedDebug,
         }));
       }
-    } catch {
-      // preview error handled silently
+    } catch (err) {
+      console.error(`[CanvasViewport] Extraction preview error for slot #${slot.slot_id}:`, err);
     }
   };
 

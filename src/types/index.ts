@@ -16,6 +16,24 @@ export type NailShape =
   | "Stiletto"
   | "Oval";
 
+export interface ExtractionDebugInfo {
+  slot_id: number;
+  method: string;
+  contour_points: number;
+  crop_bbox?: [number, number, number, number];
+  deskew_angle?: number;
+  is_inverted?: boolean;
+  dematting_metrics?: {
+    choke_px: number;
+    area_removed_pct: number;
+    core_px: number;
+  };
+  extracted_size?: [number, number];
+  duration_ms?: number;
+  warnings?: string[];
+  debug_dump_path?: string;
+}
+
 export interface DetectedSlot {
   slot_id: number;
   bbox: [number, number, number, number]; // [x, y, w, h]
@@ -30,6 +48,9 @@ export interface DetectedSlot {
   };
   card_quad?: [number, number][];
   pen_anchors?: PenAnchor[];
+  method?: string;
+  method_note?: string;
+  debug_info?: ExtractionDebugInfo;
 }
 
 export interface FingerNailAdjustment {
@@ -72,6 +93,7 @@ export interface TrayState {
   slotInverted: Record<number, boolean>;
   shapeOverrides: Record<number, string>;
   extractedPreviews: Record<number, string>;
+  extractedDebug: Record<number, ExtractionDebugInfo>;
   hoveredSlot: number | null;
   isManualEditMode: boolean;
   originalSlots: Record<number, DetectedSlot>;

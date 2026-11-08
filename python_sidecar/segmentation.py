@@ -554,6 +554,7 @@ def classify_nail_shape(contour: np.ndarray, force_inverted: Optional[bool] = No
 def segment_packaging_tray(
     image: np.ndarray,
     max_slots: int = 15,
+    refine_with_sam: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Detects press-on nail slots in a packaging tray image across both dark monochrome sets,
@@ -621,6 +622,41 @@ def segment_packaging_tray(
     for s in classical_slots:
         s["method"] = "classical"
         s["method_note"] = ml_note
+
+    if refine_with_sam and classical_slots:
+        try:
+            from ml_models import get_sam_runner
+            sam_runner = get_sam_runner()
+            if sam_runner.is_available():
+                print(f"[segmentation] Refining {len(classical_slots)} classical slots with MobileSAM...", file=sys.stderr)
+                sam_slots = []
+                image_id = f"tray_{image.shape[1]}x{image.shape[0]}"
+                sam_runner.encode_image(image, image_id=image_id)
+                for s in classical_slots:
+                    bx, by, bw, bh = s["bbox"]
+                    box = [bx, by, bx + bw, by + bh]
+                    sam_res = sam_runner.predict_prompt(
+                        image,
+                        bbox=box,
+                        image_id=image_id,
+                        slot_id=s["slot_id"],
+                    )
+                    if sam_res and sam_res.get("status") == "ok" and len(sam_res.get("contour", [])) >= 10:
+                        s_refined = dict(s)
+                        s_refined["contour"] = sam_res["contour"]
+                        s_refined["bbox"] = sam_res["bbox"]
+                        s_refined["method"] = "sam"
+                        s_refined["method_note"] = "MobileSAM zero-shot contour refinement"
+                        s_refined["metrics"] = sam_res.get("metrics", {})
+                        sam_slots.append(s_refined)
+                    else:
+                        sam_slots.append(s)
+                if len(sam_slots) >= 5:
+                    print(f"[segmentation] MobileSAM successfully refined {len(sam_slots)} slots.", file=sys.stderr)
+                    return sam_slots
+        except Exception as e:
+            print(f"[segmentation] MobileSAM refinement warning: {e}; keeping classical contours", file=sys.stderr)
+
     return classical_slots
 
 
@@ -1091,8 +1127,9 @@ def extract_nail_rgba(
         b, g, r = cv2.split(patch_bgr)
         patch_rgba = cv2.merge([b, g, r, solid_mask])
 
+        deskew_deg = 0.0
         if deskew:
-            _, active_cnt, rotated_rgba = deskew_nail_pca(active_cnt, patch_rgba)
+            deskew_deg, active_cnt, rotated_rgba = deskew_nail_pca(active_cnt, patch_rgba)
             if rotated_rgba is not None:
                 patch_rgba = rotated_rgba
 
@@ -1105,6 +1142,7 @@ def extract_nail_rgba(
             cy0 = max(0, int(np.min(ys)) - bpad)
             cy1 = min(patch_rgba.shape[0], int(np.max(ys)) + 1 + bpad)
             patch_rgba = patch_rgba[cy0:cy1, cx0:cx1]
+            active_cnt = active_cnt - np.array([[[cx0, cy0]]])
 
         should_invert = force_inverted if force_inverted is not None else is_nail_inverted(active_cnt, patch_rgba=patch_rgba)
         if auto_orient_cuticle_down and should_invert:
@@ -1119,7 +1157,13 @@ def extract_nail_rgba(
             final_alpha = np.where(core_mask > 0, 255.0, blur_alpha)
             patch_rgba[:, :, 3] = np.clip(final_alpha, 0, 255).astype(np.uint8)
 
-        return dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
+        dematted = dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
+        if metrics_out is not None:
+            metrics_out["deskew_angle"] = float(deskew_deg)
+            metrics_out["is_inverted"] = bool(should_invert)
+            metrics_out["exact_mask"] = True
+            metrics_out["crop_box"] = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+        return dematted
 
     hull = cv2.convexHull(local_pts)
     hull_mask = np.zeros((ph, pw), dtype=np.uint8)
@@ -1240,8 +1284,9 @@ def extract_nail_rgba(
     b, g, r = cv2.split(patch_bgr)
     patch_rgba = cv2.merge([b, g, r, solid_mask])
 
+    deskew_deg = 0.0
     if deskew:
-        _, active_cnt, rotated_rgba = deskew_nail_pca(active_cnt, patch_rgba)
+        deskew_deg, active_cnt, rotated_rgba = deskew_nail_pca(active_cnt, patch_rgba)
         if rotated_rgba is not None:
             patch_rgba = rotated_rgba
 
@@ -1272,7 +1317,13 @@ def extract_nail_rgba(
     # so no later resampling can reintroduce card-white edge colors.
     # Solid interior core pixels remain 100% byte-identical to the source photo.
     patch_rgba[:, :, 3] = sym_alpha
-    return dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
+    dematted = dematte_nail_edges(patch_rgba, metrics_out=metrics_out)
+    if metrics_out is not None:
+        metrics_out["deskew_angle"] = float(deskew_deg)
+        metrics_out["is_inverted"] = bool(should_invert)
+        metrics_out["exact_mask"] = False
+        metrics_out["crop_box"] = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+    return dematted
 
 
 def refit_slot_contour(image: np.ndarray, bbox: List[int]) -> Dict[str, Any]:
